@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "generatedAt": "2026-05-29T04:58:06.497Z",
+  "workspaces": [
+    {
+      "id": "unfiled",
+      "name": "미지정 워크스페이스"
+    },
+    {
+      "id": "memo",
+      "name": "memo"
+    }
+  ],
+  "notes": [
+    {
+      "id": "note-f7fdc36f7aad279d",
+      "icon": "N",
+      "title": "새 노트",
+      "tags": [],
+      "status": "active",
+      "workspace": "memo",
+      "workspaceName": "memo",
+      "folder": "memo",
+      "fileName": "note-1779945632257.md",
+      "relativePath": "memo/note-1779945632257.md",
+      "createdAt": "05. 28. 오후 02:20:32",
+      "createdAtMs": 1779945632258,
+      "updatedAt": "05. 29. 오후 01:47:35",
+      "updatedAtMs": 1780030055707
+    }
+  ]
+}

@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="ko">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Notedown Sync Login</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='auth.css') }}">
+    <script defer src="{{ url_for('static', filename='auth.js') }}"></script>
+  </head>
+  <body data-mode="login">
+    <main class="auth-shell">
+      <section class="auth-panel">
+        <header>
+          <h1>Notedown Sync</h1>
+          <p>관리 화면에 접근하려면 로그인하세요.</p>
+        </header>
+        <form id="auth-form">
+          <label>
+            <span>아이디</span>
+            <input id="username" autocomplete="username" required>
+          </label>
+          <label>
+            <span>비밀번호</span>
+            <input id="password" type="password" autocomplete="current-password" required>
+          </label>
+          <button type="submit">로그인</button>
+        </form>
+        <p id="auth-message" class="message" role="alert"></p>
+      </section>
+    </main>
+  </body>
+</html>
