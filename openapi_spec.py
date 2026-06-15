@@ -400,14 +400,52 @@ def build_openapi_spec(server_url):
                     },
                 }
             },
+            "/api/attachments/{relative_path}": {
+                "get": {
+                    "tags": ["Sync"],
+                    "summary": "Read one note attachment as base64 JSON",
+                    "description": (
+                        "Downloads a binary note attachment previously uploaded with "
+                        "/api/sync/attachment. Images and arbitrary files are returned "
+                        "as base64 JSON with SHA-256 contentHash metadata."
+                    ),
+                    "security": [{"bearerAuth": []}],
+                    "parameters": [
+                        {
+                            "name": "relative_path",
+                            "in": "path",
+                            "required": True,
+                            "description": "POSIX-style attachment path.",
+                            "schema": {"type": "string"},
+                        }
+                    ],
+                    "responses": {
+                        "200": {
+                            "description": "Attachment payload.",
+                            "content": {
+                                "application/json": {
+                                    "schema": {
+                                        "$ref": "#/components/schemas/AttachmentPayload"
+                                    }
+                                }
+                            },
+                        },
+                        "400": {"$ref": "#/components/responses/BadRequest"},
+                        "401": {"$ref": "#/components/responses/Unauthorized"},
+                    },
+                }
+            },
             "/api/sync/plan": {
                 "post": {
                     "tags": ["Sync"],
                     "summary": "Plan a full metadata-first sync",
                     "description": (
                         "Compares client metadata with server metadata and returns "
-                        "file-level upload, download, delete, and conflict targets. "
-                        "This endpoint does not upload file content."
+                        "note file and note attachment upload, download, delete, and "
+                        "conflict targets. This endpoint does not upload file content. "
+                        "Clients should include note attachment metadata with "
+                        "SHA-256 contentHash values so the server can skip unchanged "
+                        "attachment uploads before content transfer."
                     ),
                     "security": [{"bearerAuth": []}],
                     "requestBody": {
@@ -442,11 +480,31 @@ def build_openapi_spec(server_url):
                                                     "workspaceName": "memo",
                                                     "relativePath": "memo/note.md",
                                                     "updatedAtMs": 1780030055707,
+                                                    "attachments": [
+                                                        {
+                                                            "id": "att-1",
+                                                            "fileName": "diagram.png",
+                                                            "relativePath": (
+                                                                "memo/.attachments/"
+                                                                "note-1/diagram.png"
+                                                            ),
+                                                            "mimeType": "image/png",
+                                                            "size": 1280,
+                                                            "contentHash": (
+                                                                "d5f8086d38d42c76cca8"
+                                                                "e85c3b7068b8b2f2f48e"
+                                                                "6a5e318a5954f2c17f57"
+                                                                "f2ff"
+                                                            ),
+                                                            "updatedAtMs": 1780030055707,
+                                                        }
+                                                    ],
                                                 }
                                             ],
                                         },
                                     },
                                     "knownFiles": [],
+                                    "knownAttachments": [],
                                 },
                             }
                         },
@@ -524,6 +582,81 @@ def build_openapi_spec(server_url):
                     },
                 }
             },
+            "/api/sync/attachment": {
+                "post": {
+                    "tags": ["Sync"],
+                    "summary": "Upload, delete, or attach metadata for one note attachment",
+                    "description": (
+                        "Used for image and file attachments selected by "
+                        "/api/sync/plan. If the server already has the same "
+                        "contentHash, the client may omit content and send only "
+                        "attachment metadata to avoid an unnecessary upload."
+                    ),
+                    "security": [{"bearerAuth": []}],
+                    "requestBody": {
+                        "required": True,
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/AttachmentSyncRequest"
+                                },
+                                "example": {
+                                    "clientId": "macbook-1",
+                                    "baseRevision": 0,
+                                    "clientInfo": {
+                                        "hostname": "macbook-pro",
+                                        "ipAddress": "192.168.0.12",
+                                        "platform": "macOS",
+                                        "appVersion": "1.2.3",
+                                        "browser": "Chrome",
+                                        "browserVersion": "125.0.0.0",
+                                        "userAgent": "Notedown/1.2 Chrome/125",
+                                    },
+                                    "noteRelativePath": "memo/note.md",
+                                    "relativePath": "memo/.attachments/note-1/diagram.png",
+                                    "lastKnownRevision": 0,
+                                    "updatedAtMs": 1780030055707,
+                                    "contentEncoding": "base64",
+                                    "content": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAAB",
+                                    "contentHash": (
+                                        "d5f8086d38d42c76cca8e85c3b7068b8"
+                                        "b2f2f48e6a5e318a5954f2c17f57f2ff"
+                                    ),
+                                    "attachment": {
+                                        "id": "att-1",
+                                        "fileName": "diagram.png",
+                                        "relativePath": "memo/.attachments/note-1/diagram.png",
+                                        "mimeType": "image/png",
+                                        "size": 24,
+                                        "contentHash": (
+                                            "d5f8086d38d42c76cca8e85c3b7068b8"
+                                            "b2f2f48e6a5e318a5954f2c17f57f2ff"
+                                        ),
+                                        "updatedAtMs": 1780030055707,
+                                    },
+                                },
+                            }
+                        },
+                    },
+                    "responses": {
+                        "200": {
+                            "description": "Single attachment sync result.",
+                            "content": {
+                                "application/json": {
+                                    "schema": {
+                                        "$ref": (
+                                            "#/components/schemas/"
+                                            "AttachmentSyncResponse"
+                                        )
+                                    }
+                                }
+                            },
+                        },
+                        "400": {"$ref": "#/components/responses/BadRequest"},
+                        "401": {"$ref": "#/components/responses/Unauthorized"},
+                    },
+                }
+            },
             "/api/sync": {
                 "post": {
                     "tags": ["Sync"],
@@ -534,7 +667,10 @@ def build_openapi_spec(server_url):
                         "The client sends the last server revision it has seen. "
                         "If the server-side file revision is newer than the "
                         "client's lastKnownRevision and content differs, the "
-                        "server returns a conflict instead of overwriting data."
+                        "server returns a conflict instead of overwriting data. "
+                        "New clients should use /api/sync/attachment for note "
+                        "attachments so checksum-only metadata updates can skip "
+                        "unchanged binary uploads."
                     ),
                     "security": [{"bearerAuth": []}],
                     "requestBody": {
@@ -571,6 +707,18 @@ def build_openapi_spec(server_url):
                                             "updatedAtMs": 1780030055707,
                                             "contentEncoding": "utf-8",
                                             "content": "# 새 노트\n",
+                                        }
+                                    ],
+                                    "attachments": [
+                                        {
+                                            "noteRelativePath": "memo/note.md",
+                                            "relativePath": (
+                                                "memo/.attachments/"
+                                                "note-1/diagram.png"
+                                            ),
+                                            "lastKnownRevision": 0,
+                                            "contentEncoding": "base64",
+                                            "content": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAAB",
                                         }
                                     ],
                                 },
@@ -679,7 +827,7 @@ def build_openapi_spec(server_url):
                         "lastUsedAt": {"type": ["string", "null"], "format": "date-time"},
                         "connectionInfo": {"$ref": "#/components/schemas/ConnectionInfo"},
                     },
-                    "additionalProperties": False,
+                    "additionalProperties": True,
                 },
                 "TokenListResponse": {
                     "type": "object",
@@ -926,6 +1074,86 @@ def build_openapi_spec(server_url):
                     },
                     "additionalProperties": False,
                 },
+                "NoteAttachmentMetadata": {
+                    "type": "object",
+                    "required": ["relativePath"],
+                    "description": (
+                        "Attachment metadata stored inside a note object's "
+                        "attachments array. contentHash should be the SHA-256 hash "
+                        "of decoded attachment bytes."
+                    ),
+                    "properties": {
+                        "id": {"type": ["string", "null"], "example": "att-1"},
+                        "fileName": {"type": "string", "example": "diagram.png"},
+                        "relativePath": {
+                            "type": "string",
+                            "example": "memo/.attachments/note-1/diagram.png",
+                        },
+                        "noteRelativePath": {
+                            "type": ["string", "null"],
+                            "example": "memo/note.md",
+                        },
+                        "mimeType": {"type": ["string", "null"], "example": "image/png"},
+                        "size": {"type": ["integer", "null"], "minimum": 0},
+                        "contentHash": {
+                            "type": ["string", "null"],
+                            "description": "SHA-256 hash of decoded attachment content.",
+                        },
+                        "updatedAtMs": {"type": ["integer", "null"]},
+                        "deleted": {"type": "boolean", "default": False},
+                    },
+                    "additionalProperties": True,
+                },
+                "AttachmentSyncItem": {
+                    "type": "object",
+                    "required": ["relativePath"],
+                    "properties": {
+                        "noteRelativePath": {
+                            "type": "string",
+                            "description": "Note file path that owns this attachment.",
+                            "example": "memo/note.md",
+                        },
+                        "relativePath": {
+                            "type": "string",
+                            "example": "memo/.attachments/note-1/diagram.png",
+                        },
+                        "lastKnownRevision": {"type": "integer", "minimum": 0},
+                        "updatedAtMs": {"type": "integer"},
+                        "deleted": {"type": "boolean", "default": False},
+                        "contentEncoding": {
+                            "type": "string",
+                            "enum": ["base64", "utf-8"],
+                            "default": "base64",
+                        },
+                        "content": {
+                            "type": "string",
+                            "description": (
+                                "Required unless deleted is true or the server already "
+                                "has the supplied contentHash."
+                            ),
+                        },
+                        "contentHash": {
+                            "type": "string",
+                            "description": "SHA-256 hash of decoded attachment content.",
+                        },
+                        "fileName": {"type": "string"},
+                        "mimeType": {"type": "string"},
+                        "attachmentId": {"type": "string"},
+                        "noteId": {"type": "string"},
+                        "workspace": {
+                            "type": "object",
+                            "additionalProperties": True,
+                        },
+                        "note": {
+                            "type": "object",
+                            "additionalProperties": True,
+                        },
+                        "attachment": {
+                            "$ref": "#/components/schemas/NoteAttachmentMetadata"
+                        },
+                    },
+                    "additionalProperties": True,
+                },
                 "KnownFile": {
                     "type": "object",
                     "required": ["relativePath"],
@@ -936,6 +1164,14 @@ def build_openapi_spec(server_url):
                         "updatedAtMs": {"type": "integer"},
                     },
                     "additionalProperties": False,
+                },
+                "KnownAttachment": {
+                    "allOf": [{"$ref": "#/components/schemas/KnownFile"}],
+                    "description": (
+                        "Client-side attachment sync state from the previous "
+                        "manifest. contentHash is used to avoid uploading unchanged "
+                        "attachment bytes."
+                    ),
                 },
                 "ClientInfo": {
                     "type": "object",
@@ -1055,6 +1291,16 @@ def build_openapi_spec(server_url):
                             "items": {"$ref": "#/components/schemas/KnownFile"},
                             "default": [],
                         },
+                        "knownAttachments": {
+                            "type": "array",
+                            "description": (
+                                "Client-side note attachment sync state. Include "
+                                "contentHash values from the previous manifest so "
+                                "/api/sync/plan can skip unchanged attachment uploads."
+                            ),
+                            "items": {"$ref": "#/components/schemas/KnownAttachment"},
+                            "default": [],
+                        },
                     },
                     "additionalProperties": False,
                 },
@@ -1095,6 +1341,29 @@ def build_openapi_spec(server_url):
                     },
                     "additionalProperties": False,
                 },
+                "AttachmentSyncRequest": {
+                    "allOf": [
+                        {
+                            "type": "object",
+                            "required": ["clientId", "relativePath"],
+                            "properties": {
+                                "clientId": {
+                                    "type": "string",
+                                    "example": "macbook-1",
+                                },
+                                "baseRevision": {
+                                    "type": "integer",
+                                    "minimum": 0,
+                                    "default": 0,
+                                },
+                                "clientInfo": {
+                                    "$ref": "#/components/schemas/ClientInfo"
+                                },
+                            },
+                        },
+                        {"$ref": "#/components/schemas/AttachmentSyncItem"},
+                    ]
+                },
                 "SyncRequest": {
                     "type": "object",
                     "required": ["clientId"],
@@ -1106,6 +1375,13 @@ def build_openapi_spec(server_url):
                         "files": {
                             "type": "array",
                             "items": {"$ref": "#/components/schemas/FileSyncItem"},
+                            "default": [],
+                        },
+                        "attachments": {
+                            "type": "array",
+                            "items": {
+                                "$ref": "#/components/schemas/AttachmentSyncItem"
+                            },
                             "default": [],
                         },
                     },
@@ -1176,8 +1452,22 @@ def build_openapi_spec(server_url):
                         "content": {"type": "string"},
                         "gitCommit": {"type": ["string", "null"]},
                         "rolledBackToGitCommit": {"type": ["string", "null"]},
+                        "kind": {"type": ["string", "null"], "enum": ["attachment", None]},
+                        "noteRelativePath": {"type": ["string", "null"]},
+                        "noteId": {"type": ["string", "null"]},
+                        "attachmentId": {"type": ["string", "null"]},
+                        "fileName": {"type": ["string", "null"]},
+                        "mimeType": {"type": ["string", "null"]},
                     },
                     "additionalProperties": False,
+                },
+                "AttachmentPayload": {
+                    "allOf": [{"$ref": "#/components/schemas/FilePayload"}],
+                    "description": (
+                        "Base64 attachment payload. Attachment responses include "
+                        "kind=attachment plus noteRelativePath, fileName, mimeType, "
+                        "and optional attachmentId/noteId metadata."
+                    ),
                 },
                 "SyncPlanFileItem": {
                     "type": "object",
@@ -1194,6 +1484,40 @@ def build_openapi_spec(server_url):
                             "additionalProperties": True,
                         },
                         "serverFile": {
+                            "anyOf": [
+                                {"$ref": "#/components/schemas/FileRecord"},
+                                {"type": "null"},
+                            ]
+                        },
+                    },
+                    "additionalProperties": True,
+                },
+                "SyncPlanAttachmentItem": {
+                    "type": "object",
+                    "required": ["type", "relativePath", "reason"],
+                    "properties": {
+                        "type": {"type": "string", "const": "attachment"},
+                        "relativePath": {"type": "string"},
+                        "reason": {"type": "string"},
+                        "contentRequired": {
+                            "type": "boolean",
+                            "description": (
+                                "When false, the client can call /api/sync/attachment "
+                                "with contentHash and attachment metadata only."
+                            ),
+                        },
+                        "noteRelativePath": {"type": ["string", "null"]},
+                        "note": {
+                            "type": ["object", "null"],
+                            "additionalProperties": True,
+                        },
+                        "attachment": {
+                            "anyOf": [
+                                {"$ref": "#/components/schemas/NoteAttachmentMetadata"},
+                                {"type": "null"},
+                            ]
+                        },
+                        "serverAttachment": {
                             "anyOf": [
                                 {"$ref": "#/components/schemas/FileRecord"},
                                 {"type": "null"},
@@ -1231,6 +1555,24 @@ def build_openapi_spec(server_url):
                                 {"type": "null"},
                             ]
                         },
+                        "clientAttachment": {
+                            "anyOf": [
+                                {"$ref": "#/components/schemas/NoteAttachmentMetadata"},
+                                {"type": "null"},
+                            ]
+                        },
+                        "serverAttachmentMetadata": {
+                            "anyOf": [
+                                {"$ref": "#/components/schemas/NoteAttachmentMetadata"},
+                                {"type": "null"},
+                            ]
+                        },
+                        "serverAttachment": {
+                            "anyOf": [
+                                {"$ref": "#/components/schemas/FileRecord"},
+                                {"type": "null"},
+                            ]
+                        },
                     },
                     "additionalProperties": True,
                 },
@@ -1241,6 +1583,10 @@ def build_openapi_spec(server_url):
                         "downloadFiles",
                         "deleteServerFiles",
                         "deleteLocalFiles",
+                        "uploadAttachments",
+                        "downloadAttachments",
+                        "deleteServerAttachments",
+                        "deleteLocalAttachments",
                         "conflicts",
                     ],
                     "properties": {
@@ -1260,6 +1606,30 @@ def build_openapi_spec(server_url):
                             "type": "array",
                             "items": {"$ref": "#/components/schemas/SyncPlanFileItem"},
                         },
+                        "uploadAttachments": {
+                            "type": "array",
+                            "items": {
+                                "$ref": "#/components/schemas/SyncPlanAttachmentItem"
+                            },
+                        },
+                        "downloadAttachments": {
+                            "type": "array",
+                            "items": {
+                                "$ref": "#/components/schemas/SyncPlanAttachmentItem"
+                            },
+                        },
+                        "deleteServerAttachments": {
+                            "type": "array",
+                            "items": {
+                                "$ref": "#/components/schemas/SyncPlanAttachmentItem"
+                            },
+                        },
+                        "deleteLocalAttachments": {
+                            "type": "array",
+                            "items": {
+                                "$ref": "#/components/schemas/SyncPlanAttachmentItem"
+                            },
+                        },
                         "conflicts": {
                             "type": "array",
                             "items": {"$ref": "#/components/schemas/SyncPlanConflict"},
@@ -1277,6 +1647,12 @@ def build_openapi_spec(server_url):
                         "contentHash": {"type": ["string", "null"]},
                         "deleted": {"type": "boolean"},
                         "gitCommit": {"type": ["string", "null"]},
+                        "kind": {"type": ["string", "null"], "enum": ["attachment", None]},
+                        "noteRelativePath": {"type": ["string", "null"]},
+                        "noteId": {"type": ["string", "null"]},
+                        "attachmentId": {"type": ["string", "null"]},
+                        "fileName": {"type": ["string", "null"]},
+                        "mimeType": {"type": ["string", "null"]},
                     },
                     "additionalProperties": False,
                 },
@@ -1311,6 +1687,30 @@ def build_openapi_spec(server_url):
                         "clientUpdatedAtMs": {"type": ["integer", "null"]},
                         "gitCommit": {"type": ["string", "null"]},
                         "rolledBackToGitCommit": {"type": ["string", "null"]},
+                        "kind": {"type": ["string", "null"], "enum": ["attachment", None]},
+                        "noteRelativePath": {"type": ["string", "null"]},
+                        "noteId": {"type": ["string", "null"]},
+                        "attachmentId": {"type": ["string", "null"]},
+                        "fileName": {"type": ["string", "null"]},
+                        "mimeType": {"type": ["string", "null"]},
+                        "note": {
+                            "anyOf": [
+                                {"$ref": "#/components/schemas/ManifestFileNote"},
+                                {"type": "null"},
+                            ],
+                        },
+                    },
+                    "additionalProperties": True,
+                },
+                "ManifestFileNote": {
+                    "type": "object",
+                    "description": "Display-safe note metadata joined into a manifest file record.",
+                    "properties": {
+                        "title": {"type": ["string", "null"]},
+                        "folder": {"type": ["string", "null"]},
+                        "workspace": {"type": ["string", "null"]},
+                        "workspaceName": {"type": ["string", "null"]},
+                        "fileName": {"type": ["string", "null"]},
                     },
                     "additionalProperties": True,
                 },
@@ -1339,6 +1739,7 @@ def build_openapi_spec(server_url):
                         "updatedAt",
                         "metadata",
                         "files",
+                        "attachments",
                         "clients",
                     ],
                     "properties": {
@@ -1358,6 +1759,14 @@ def build_openapi_spec(server_url):
                             "type": "array",
                             "items": {"$ref": "#/components/schemas/FileRecord"},
                         },
+                        "attachments": {
+                            "type": "array",
+                            "description": (
+                                "Note attachments stored separately from markdown "
+                                "note files."
+                            ),
+                            "items": {"$ref": "#/components/schemas/FileRecord"},
+                        },
                         "clients": {
                             "type": "object",
                             "additionalProperties": {
@@ -1375,7 +1784,10 @@ def build_openapi_spec(server_url):
                         "syncedAt",
                         "accepted",
                         "conflicts",
+                        "acceptedAttachments",
+                        "attachmentConflicts",
                         "remoteChanges",
+                        "remoteAttachmentChanges",
                         "manifest",
                     ],
                     "properties": {
@@ -1391,9 +1803,21 @@ def build_openapi_spec(server_url):
                             "type": "array",
                             "items": {"$ref": "#/components/schemas/ConflictFileResult"},
                         },
+                        "acceptedAttachments": {
+                            "type": "array",
+                            "items": {"$ref": "#/components/schemas/AcceptedFileResult"},
+                        },
+                        "attachmentConflicts": {
+                            "type": "array",
+                            "items": {"$ref": "#/components/schemas/ConflictFileResult"},
+                        },
                         "remoteChanges": {
                             "type": "array",
                             "items": {"$ref": "#/components/schemas/FilePayload"},
+                        },
+                        "remoteAttachmentChanges": {
+                            "type": "array",
+                            "items": {"$ref": "#/components/schemas/AttachmentPayload"},
                         },
                         "manifest": {"$ref": "#/components/schemas/Manifest"},
                     },
@@ -1433,6 +1857,30 @@ def build_openapi_spec(server_url):
                         "serverRevision": {"type": "integer"},
                         "syncedAt": {"type": "string", "format": "date-time"},
                         "file": {
+                            "anyOf": [
+                                {"$ref": "#/components/schemas/AcceptedFileResult"},
+                                {"$ref": "#/components/schemas/ConflictFileResult"},
+                            ]
+                        },
+                        "metadata": {"$ref": "#/components/schemas/MetadataSyncResult"},
+                        "manifest": {"$ref": "#/components/schemas/Manifest"},
+                    },
+                    "additionalProperties": False,
+                },
+                "AttachmentSyncResponse": {
+                    "type": "object",
+                    "required": [
+                        "status",
+                        "serverRevision",
+                        "syncedAt",
+                        "attachment",
+                        "manifest",
+                    ],
+                    "properties": {
+                        "status": {"type": "string", "enum": ["ok", "conflict"]},
+                        "serverRevision": {"type": "integer"},
+                        "syncedAt": {"type": "string", "format": "date-time"},
+                        "attachment": {
                             "anyOf": [
                                 {"$ref": "#/components/schemas/AcceptedFileResult"},
                                 {"$ref": "#/components/schemas/ConflictFileResult"},

@@ -1,4 +1,5 @@
 import base64
+import hashlib
 import unittest
 from tempfile import TemporaryDirectory
 
@@ -54,6 +55,18 @@ class SyncApiTest(unittest.TestCase):
 
     def decoded_content(self, payload):
         return base64.b64decode(payload["content"]).decode("utf-8")
+
+    def attachment_metadata(self, content):
+        digest = hashlib.sha256(content).hexdigest()
+        return {
+            "id": "att-1",
+            "fileName": "diagram.png",
+            "relativePath": "memo/.attachments/note-1/diagram.png",
+            "mimeType": "image/png",
+            "size": len(content),
+            "contentHash": digest,
+            "updatedAtMs": 11,
+        }
 
     def test_push_and_manifest(self):
         response = self.client.post(
@@ -290,6 +303,343 @@ class SyncApiTest(unittest.TestCase):
         self.assertEqual(upload["file"]["status"], "accepted")
         self.assertEqual(upload["metadata"]["status"], "accepted")
         self.assertEqual(upload["serverRevision"], 2)
+        manifest_file = upload["manifest"]["files"][0]
+        self.assertEqual(manifest_file["note"]["title"], "새 노트")
+        self.assertEqual(manifest_file["note"]["folder"], "memo")
+        self.assertNotIn("id", manifest_file["note"])
+
+    def test_attachment_upload_download_and_plan_checksum(self):
+        content = b"\x89PNG\r\nnotedown-image"
+        digest = hashlib.sha256(content).hexdigest()
+        metadata = self.note_metadata()
+        attachment = self.attachment_metadata(content)
+        metadata["notes"][0]["attachments"] = [attachment]
+
+        upload_response = self.client.post(
+            "/api/sync/attachment",
+            headers=self.headers,
+            json={
+                "clientId": "client-a",
+                "baseRevision": 0,
+                "noteRelativePath": "memo/note.md",
+                "relativePath": attachment["relativePath"],
+                "lastKnownRevision": 0,
+                "updatedAtMs": attachment["updatedAtMs"],
+                "contentEncoding": "base64",
+                "content": base64.b64encode(content).decode("ascii"),
+                "contentHash": digest,
+                "workspace": {"id": "memo", "name": "memo"},
+                "note": metadata["notes"][0],
+                "attachment": attachment,
+            },
+        )
+
+        self.assertEqual(upload_response.status_code, 200)
+        upload = upload_response.get_json()
+        self.assertEqual(upload["status"], "ok")
+        self.assertEqual(upload["attachment"]["status"], "accepted")
+        self.assertEqual(upload["metadata"]["status"], "accepted")
+        self.assertEqual(upload["attachment"]["kind"], "attachment")
+        self.assertEqual(upload["manifest"]["attachments"][0]["contentHash"], digest)
+        self.assertEqual(
+            upload["manifest"]["attachments"][0]["note"]["title"],
+            "새 노트",
+        )
+
+        download_response = self.client.get(
+            f"/api/attachments/{attachment['relativePath']}",
+            headers=self.headers,
+        )
+        self.assertEqual(download_response.status_code, 200)
+        download = download_response.get_json()
+        self.assertEqual(download["mimeType"], "image/png")
+        self.assertEqual(download["contentHash"], digest)
+        self.assertEqual(base64.b64decode(download["content"]), content)
+
+        plan_response = self.client.post(
+            "/api/sync/plan",
+            headers=self.headers,
+            json={
+                "clientId": "client-a",
+                "baseRevision": upload["serverRevision"],
+                "metadata": {
+                    "lastKnownRevision": upload["manifest"]["metadata"]["revision"],
+                    "body": metadata,
+                },
+                "knownAttachments": [
+                    {
+                        "relativePath": attachment["relativePath"],
+                        "lastKnownRevision": upload["attachment"]["revision"],
+                        "contentHash": digest,
+                    }
+                ],
+            },
+        )
+
+        self.assertEqual(plan_response.status_code, 200)
+        plan = plan_response.get_json()["plan"]
+        self.assertEqual(plan["uploadAttachments"], [])
+        self.assertEqual(plan["downloadAttachments"], [])
+
+        changed_metadata = self.note_metadata()
+        changed_attachment = dict(attachment)
+        changed_attachment["contentHash"] = hashlib.sha256(b"changed").hexdigest()
+        changed_attachment["size"] = len(b"changed")
+        changed_metadata["notes"][0]["attachments"] = [changed_attachment]
+        changed_plan = self.client.post(
+            "/api/sync/plan",
+            headers=self.headers,
+            json={
+                "clientId": "client-a",
+                "baseRevision": upload["serverRevision"],
+                "metadata": {
+                    "lastKnownRevision": upload["manifest"]["metadata"]["revision"],
+                    "body": changed_metadata,
+                },
+                "knownAttachments": [
+                    {
+                        "relativePath": attachment["relativePath"],
+                        "lastKnownRevision": upload["attachment"]["revision"],
+                        "contentHash": digest,
+                    }
+                ],
+            },
+        ).get_json()["plan"]
+
+        self.assertEqual(
+            changed_plan["uploadAttachments"][0]["relativePath"],
+            attachment["relativePath"],
+        )
+        self.assertTrue(changed_plan["uploadAttachments"][0]["contentRequired"])
+
+    def test_attachment_metadata_only_sync_skips_existing_content_upload(self):
+        content = b"report-binary"
+        digest = hashlib.sha256(content).hexdigest()
+        metadata = self.note_metadata()
+        attachment = self.attachment_metadata(content)
+        metadata["notes"][0]["attachments"] = [attachment]
+
+        batch = self.client.post(
+            "/api/sync",
+            headers=self.headers,
+            json={
+                "clientId": "client-a",
+                "baseRevision": 0,
+                "attachments": [
+                    {
+                        "noteRelativePath": "memo/note.md",
+                        "relativePath": attachment["relativePath"],
+                        "lastKnownRevision": 0,
+                        "contentEncoding": "base64",
+                        "content": base64.b64encode(content).decode("ascii"),
+                        "contentHash": digest,
+                    }
+                ],
+            },
+        ).get_json()
+
+        plan = self.client.post(
+            "/api/sync/plan",
+            headers=self.headers,
+            json={
+                "clientId": "client-a",
+                "baseRevision": batch["serverRevision"],
+                "metadata": {
+                    "lastKnownRevision": 0,
+                    "body": metadata,
+                },
+                "knownAttachments": [
+                    {
+                        "relativePath": attachment["relativePath"],
+                        "lastKnownRevision": batch["acceptedAttachments"][0]["revision"],
+                        "contentHash": digest,
+                    }
+                ],
+            },
+        ).get_json()["plan"]
+
+        self.assertEqual(
+            plan["uploadAttachments"][0]["reason"],
+            "missing_server_attachment_metadata",
+        )
+        self.assertFalse(plan["uploadAttachments"][0]["contentRequired"])
+
+        metadata_only = self.client.post(
+            "/api/sync/attachment",
+            headers=self.headers,
+            json={
+                "clientId": "client-a",
+                "baseRevision": batch["serverRevision"],
+                "noteRelativePath": "memo/note.md",
+                "relativePath": attachment["relativePath"],
+                "lastKnownRevision": batch["acceptedAttachments"][0]["revision"],
+                "contentHash": digest,
+                "note": metadata["notes"][0],
+                "attachment": attachment,
+            },
+        ).get_json()
+
+        self.assertEqual(metadata_only["attachment"]["status"], "unchanged")
+        self.assertEqual(metadata_only["metadata"]["status"], "accepted")
+        self.assertEqual(
+            metadata_only["manifest"]["attachments"][0]["contentHash"],
+            digest,
+        )
+
+    def test_dummy_note_with_file_and_image_attachments_round_trip(self):
+        note_content = "# 더미 첨부 노트\n\n이미지와 파일을 함께 첨부합니다.\n"
+        image_content = b"\x89PNG\r\n\x1a\nnotedown-dummy-image"
+        file_content = b"dummy attachment file\nline 2\n"
+        metadata = self.note_metadata(updated_at_ms=100)
+        metadata["notes"][0]["title"] = "더미 첨부 노트"
+
+        image_attachment = self.attachment_metadata(image_content)
+        file_digest = hashlib.sha256(file_content).hexdigest()
+        file_attachment = {
+            "id": "att-2",
+            "fileName": "dummy.txt",
+            "relativePath": "memo/.attachments/note-1/dummy.txt",
+            "mimeType": "text/plain",
+            "size": len(file_content),
+            "contentHash": file_digest,
+            "updatedAtMs": 12,
+        }
+        metadata["notes"][0]["attachments"] = [
+            image_attachment,
+            file_attachment,
+        ]
+
+        initial_plan = self.client.post(
+            "/api/sync/plan",
+            headers=self.headers,
+            json={
+                "clientId": "client-a",
+                "baseRevision": 0,
+                "metadata": {"lastKnownRevision": 0, "body": metadata},
+            },
+        ).get_json()["plan"]
+
+        self.assertEqual(
+            initial_plan["uploadFiles"][0]["relativePath"],
+            "memo/note.md",
+        )
+        self.assertEqual(len(initial_plan["uploadAttachments"]), 2)
+        self.assertTrue(
+            all(item["contentRequired"] for item in initial_plan["uploadAttachments"])
+        )
+
+        note_upload = self.client.post(
+            "/api/sync/file",
+            headers=self.headers,
+            json={
+                "clientId": "client-a",
+                "baseRevision": 0,
+                "relativePath": "memo/note.md",
+                "lastKnownRevision": 0,
+                "updatedAtMs": 100,
+                "contentEncoding": "utf-8",
+                "content": note_content,
+                "workspace": {"id": "memo", "name": "memo"},
+                "note": metadata["notes"][0],
+            },
+        ).get_json()
+
+        image_upload = self.client.post(
+            "/api/sync/attachment",
+            headers=self.headers,
+            json={
+                "clientId": "client-a",
+                "baseRevision": note_upload["serverRevision"],
+                "noteRelativePath": "memo/note.md",
+                "relativePath": image_attachment["relativePath"],
+                "lastKnownRevision": 0,
+                "updatedAtMs": image_attachment["updatedAtMs"],
+                "contentEncoding": "base64",
+                "content": base64.b64encode(image_content).decode("ascii"),
+                "contentHash": image_attachment["contentHash"],
+                "note": metadata["notes"][0],
+                "attachment": image_attachment,
+            },
+        ).get_json()
+
+        file_upload = self.client.post(
+            "/api/sync/attachment",
+            headers=self.headers,
+            json={
+                "clientId": "client-a",
+                "baseRevision": image_upload["serverRevision"],
+                "noteRelativePath": "memo/note.md",
+                "relativePath": file_attachment["relativePath"],
+                "lastKnownRevision": 0,
+                "updatedAtMs": file_attachment["updatedAtMs"],
+                "contentEncoding": "base64",
+                "content": base64.b64encode(file_content).decode("ascii"),
+                "contentHash": file_attachment["contentHash"],
+                "note": metadata["notes"][0],
+                "attachment": file_attachment,
+            },
+        ).get_json()
+
+        self.assertEqual(note_upload["file"]["status"], "accepted")
+        self.assertEqual(image_upload["attachment"]["status"], "accepted")
+        self.assertEqual(file_upload["attachment"]["status"], "accepted")
+        self.assertEqual(len(file_upload["manifest"]["attachments"]), 2)
+
+        note_download = self.client.get(
+            "/api/files/memo/note.md",
+            headers=self.headers,
+        ).get_json()
+        image_download = self.client.get(
+            f"/api/attachments/{image_attachment['relativePath']}",
+            headers=self.headers,
+        ).get_json()
+        file_download = self.client.get(
+            f"/api/attachments/{file_attachment['relativePath']}",
+            headers=self.headers,
+        ).get_json()
+
+        self.assertEqual(self.decoded_content(note_download), note_content)
+        self.assertEqual(base64.b64decode(image_download["content"]), image_content)
+        self.assertEqual(base64.b64decode(file_download["content"]), file_content)
+        self.assertEqual(image_download["mimeType"], "image/png")
+        self.assertEqual(file_download["mimeType"], "text/plain")
+
+        settled_plan = self.client.post(
+            "/api/sync/plan",
+            headers=self.headers,
+            json={
+                "clientId": "client-a",
+                "baseRevision": file_upload["serverRevision"],
+                "metadata": {
+                    "lastKnownRevision": file_upload["manifest"]["metadata"]["revision"],
+                    "body": metadata,
+                },
+                "knownFiles": [
+                    {
+                        "relativePath": "memo/note.md",
+                        "lastKnownRevision": note_upload["file"]["revision"],
+                        "contentHash": note_upload["file"]["contentHash"],
+                    }
+                ],
+                "knownAttachments": [
+                    {
+                        "relativePath": image_attachment["relativePath"],
+                        "lastKnownRevision": image_upload["attachment"]["revision"],
+                        "contentHash": image_attachment["contentHash"],
+                    },
+                    {
+                        "relativePath": file_attachment["relativePath"],
+                        "lastKnownRevision": file_upload["attachment"]["revision"],
+                        "contentHash": file_attachment["contentHash"],
+                    },
+                ],
+            },
+        ).get_json()["plan"]
+
+        self.assertEqual(settled_plan["uploadFiles"], [])
+        self.assertEqual(settled_plan["downloadFiles"], [])
+        self.assertEqual(settled_plan["uploadAttachments"], [])
+        self.assertEqual(settled_plan["downloadAttachments"], [])
 
     def test_file_upload_creates_git_history(self):
         first = self.client.post(
@@ -672,6 +1022,8 @@ class SyncApiTest(unittest.TestCase):
         self.assertIn("/api/sync", spec["paths"])
         self.assertIn("/api/sync/plan", spec["paths"])
         self.assertIn("/api/sync/file", spec["paths"])
+        self.assertIn("/api/sync/attachment", spec["paths"])
+        self.assertIn("/api/attachments/{relative_path}", spec["paths"])
         self.assertIn("/api/setup", spec["paths"])
         self.assertIn("/api/setup/status", spec["paths"])
         self.assertIn("/api/admin/tokens", spec["paths"])
@@ -701,6 +1053,12 @@ class SyncApiTest(unittest.TestCase):
         self.assertIn("FileVersionResponse", schemas)
         self.assertIn("FileRollbackRequest", schemas)
         self.assertIn("FileRollbackResponse", schemas)
+        self.assertIn("ManifestFileNote", schemas)
+        self.assertIn("NoteAttachmentMetadata", schemas)
+        self.assertIn("KnownAttachment", schemas)
+        self.assertIn("AttachmentSyncRequest", schemas)
+        self.assertIn("AttachmentSyncResponse", schemas)
+        self.assertIn("AttachmentPayload", schemas)
 
         client_info = schemas["ClientInfo"]
         self.assertIn("ipAddress", client_info["properties"])
@@ -722,12 +1080,20 @@ class SyncApiTest(unittest.TestCase):
             ]["example"]
         )
         self.assertEqual(plan_example["clientInfo"]["browser"], "Chrome")
+        self.assertIn("knownAttachments", plan_example)
+        self.assertIn("attachments", plan_example["metadata"]["body"]["notes"][0])
         file_example = (
             spec["paths"]["/api/sync/file"]["post"]["requestBody"]["content"][
                 "application/json"
             ]["example"]
         )
         self.assertEqual(file_example["clientInfo"]["browserVersion"], "125.0.0.0")
+        attachment_example = (
+            spec["paths"]["/api/sync/attachment"]["post"]["requestBody"]["content"][
+                "application/json"
+            ]["example"]
+        )
+        self.assertEqual(attachment_example["attachment"]["mimeType"], "image/png")
         sync_example = (
             spec["paths"]["/api/sync"]["post"]["requestBody"]["content"][
                 "application/json"
@@ -750,6 +1116,13 @@ class SyncApiTest(unittest.TestCase):
         self.assertEqual(admin_response.status_code, 200)
         self.assertIn("text/html", admin_response.content_type)
         self.assertIn(b"Notedown Sync Admin", admin_response.data)
+        self.assertIn(b'id="summary-file-count"', admin_response.data)
+        self.assertIn(b'id="summary-last-sync"', admin_response.data)
+        self.assertIn(b'id="folder-filter"', admin_response.data)
+        self.assertNotIn(b'class="summary-item"', admin_response.data)
+        self.assertIn(b'id="attachment-list"', admin_response.data)
+        self.assertIn(b'id="attachment-modal"', admin_response.data)
+        self.assertIn(b'id="attachment-modal-body"', admin_response.data)
         self.assertIn(b'id="tokens-table"', admin_response.data)
         self.assertIn(b'id="history-table"', admin_response.data)
         self.assertIn(b'id="rollback-button"', admin_response.data)

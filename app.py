@@ -328,6 +328,11 @@ def create_app(test_config=None):
     def read_file(relative_path):
         return jsonify(store.file_payload(relative_path))
 
+    @app.get("/api/attachments/<path:relative_path>")
+    @auth_required
+    def read_attachment(relative_path):
+        return jsonify(store.attachment_payload(relative_path))
+
     @app.get("/api/admin/files/<path:relative_path>/history")
     @auth_required
     def admin_file_history(relative_path):
@@ -381,6 +386,20 @@ def create_app(test_config=None):
         )
         return jsonify(result)
 
+    @app.post("/api/sync/attachment")
+    @auth_required
+    def sync_attachment():
+        payload = request.get_json(silent=True)
+        if not isinstance(payload, dict):
+            raise SyncError("JSON object payload is required.")
+
+        result = store.sync_attachment_upload(
+            payload,
+            user=request.current_user,
+            connection_info=client_connection_info(),
+        )
+        return jsonify(result)
+
     @app.post("/api/sync")
     @auth_required
     def sync():
@@ -399,4 +418,4 @@ def create_app(test_config=None):
 
 
 if __name__ == "__main__":
-    create_app().run(host="0.0.0.0", port=int(os.environ.get("PORT", "5500")))
+    create_app().run(host="0.0.0.0", port=int(os.environ.get("PORT", "5500")), debug=True)

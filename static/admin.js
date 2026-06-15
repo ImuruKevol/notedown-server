@@ -1,9 +1,12 @@
 const state = {
   manifest: null,
   files: [],
+  attachments: [],
   tokens: [],
   account: null,
   selectedPath: null,
+  selectedAttachmentPath: null,
+  selectedAttachmentObjectUrl: null,
   history: [],
   selectedHistoryCommit: null,
 };
@@ -16,19 +19,23 @@ const els = {
   logout: document.querySelector("#logout-button"),
   menuButtons: document.querySelectorAll("[data-admin-section]"),
   adminSections: document.querySelectorAll("[data-admin-panel]"),
-  revision: document.querySelector("#summary-revision"),
-  metadata: document.querySelector("#summary-metadata"),
-  fileCount: document.querySelector("#summary-files"),
-  clientCount: document.querySelector("#summary-clients"),
-  tokenCount: document.querySelector("#summary-tokens"),
-  manifestUpdated: document.querySelector("#manifest-updated"),
+  fileCount: document.querySelector("#summary-file-count"),
+  lastSync: document.querySelector("#summary-last-sync"),
   fileFilter: document.querySelector("#file-filter"),
+  folderFilter: document.querySelector("#folder-filter"),
   filesTable: document.querySelector("#files-table"),
   clientsTable: document.querySelector("#clients-table"),
   tokensTable: document.querySelector("#tokens-table"),
   previewPath: document.querySelector("#preview-path"),
   selectedFileMeta: document.querySelector("#selected-file-meta"),
   preview: document.querySelector("#file-preview"),
+  attachmentsStatus: document.querySelector("#attachments-status"),
+  attachmentList: document.querySelector("#attachment-list"),
+  attachmentModal: document.querySelector("#attachment-modal"),
+  attachmentModalTitle: document.querySelector("#attachment-modal-title"),
+  attachmentModalMeta: document.querySelector("#attachment-modal-meta"),
+  attachmentModalBody: document.querySelector("#attachment-modal-body"),
+  attachmentModalDownload: document.querySelector("#attachment-modal-download"),
   rollbackButton: document.querySelector("#rollback-button"),
   historyStatus: document.querySelector("#history-status"),
   historyTable: document.querySelector("#history-table"),
@@ -97,21 +104,132 @@ function encodePath(path) {
   return path.split("/").map(encodeURIComponent).join("/");
 }
 
+function cleanText(value) {
+  return typeof value === "string" ? value.trim() : "";
+}
+
+function folderFromPath(relativePath) {
+  const path = cleanText(relativePath);
+  const separatorIndex = path.lastIndexOf("/");
+  if (separatorIndex <= 0) return "루트";
+  return path.slice(0, separatorIndex);
+}
+
+function noteInfo(file) {
+  return objectOrEmpty(file?.note);
+}
+
+function fileTitle(file) {
+  return cleanText(noteInfo(file).title) || "제목 없음";
+}
+
+function fileFolder(file) {
+  const note = noteInfo(file);
+  return (
+    cleanText(note.folder) ||
+    cleanText(note.workspaceName) ||
+    cleanText(note.workspace) ||
+    folderFromPath(file?.relativePath)
+  );
+}
+
+function fileSearchText(file) {
+  return fileTitle(file).toLowerCase();
+}
+
+function fileSortKey(file) {
+  return `${fileFolder(file)} ${fileTitle(file)} ${cleanText(file?.relativePath)}`;
+}
+
+function attachmentsForFile(file) {
+  const relativePath = cleanText(file?.relativePath);
+  if (!relativePath) return [];
+  return state.attachments
+    .filter((attachment) => cleanText(attachment?.noteRelativePath) === relativePath)
+    .sort((a, b) => attachmentTitle(a).localeCompare(attachmentTitle(b), "ko-KR"));
+}
+
+function attachmentTitle(attachment) {
+  return (
+    cleanText(attachment?.fileName) ||
+    cleanText(attachment?.attachment?.fileName) ||
+    cleanText(attachment?.relativePath).split("/").pop() ||
+    "첨부 파일"
+  );
+}
+
+function attachmentTypeLabel(attachment) {
+  const mimeType = cleanText(attachment?.mimeType);
+  if (mimeType.startsWith("image/")) return "이미지";
+  if (mimeType) return mimeType;
+  return "파일";
+}
+
+function isImageAttachment(attachment) {
+  return cleanText(attachment?.mimeType).startsWith("image/");
+}
+
+function isTextAttachment(attachment) {
+  const mimeType = cleanText(attachment?.mimeType);
+  const fileName = attachmentTitle(attachment).toLowerCase();
+  return (
+    mimeType.startsWith("text/") ||
+    mimeType === "application/json" ||
+    fileName.endsWith(".txt") ||
+    fileName.endsWith(".md") ||
+    fileName.endsWith(".json")
+  );
+}
+
+function folderOptions() {
+  return [...new Set(state.files.map(fileFolder))]
+    .filter(Boolean)
+    .sort((a, b) => a.localeCompare(b, "ko-KR"));
+}
+
+function renderFolderFilter() {
+  const folders = folderOptions();
+  const selectedFolder = els.folderFilter.value;
+  const nextFolder = folders.includes(selectedFolder) ? selectedFolder : "";
+
+  els.folderFilter.innerHTML = [
+    '<option value="">전체 폴더</option>',
+    ...folders.map((folder) => (
+      `<option value="${escapeHtml(folder)}">${escapeHtml(folder)}</option>`
+    )),
+  ].join("");
+  els.folderFilter.value = nextFolder;
+}
+
+function lastSyncTime(manifest) {
+  const syncTimes = Object.values(manifest.clients || {})
+    .map((client) => client?.lastSyncAt)
+    .filter(Boolean)
+    .map((value) => new Date(value).getTime())
+    .filter((value) => !Number.isNaN(value));
+
+  if (syncTimes.length) {
+    return new Date(Math.max(...syncTimes)).toISOString();
+  }
+  return manifest.metadata?.updatedAt || manifest.updatedAt;
+}
+
 function renderSummary(manifest) {
   const files = manifest.files || [];
-  const clients = manifest.clients || {};
-  els.revision.textContent = manifest.serverRevision ?? "-";
-  els.metadata.textContent = manifest.metadata?.revision ?? "-";
-  els.fileCount.textContent = files.length;
-  els.clientCount.textContent = Object.keys(clients).length;
-  els.manifestUpdated.textContent = `업데이트: ${formatDate(manifest.updatedAt)}`;
+  const activeFileCount = files.filter((file) => !file.deleted).length;
+  els.fileCount.textContent = `${activeFileCount.toLocaleString("ko-KR")}개`;
+  els.lastSync.textContent = formatDate(lastSyncTime(manifest));
 }
 
 function renderFiles() {
   const filter = els.fileFilter.value.trim().toLowerCase();
-  const rows = state.files.filter((file) =>
-    file.relativePath.toLowerCase().includes(filter)
-  );
+  const selectedFolder = els.folderFilter.value;
+  const rows = state.files
+    .filter((file) => (
+      (!selectedFolder || fileFolder(file) === selectedFolder) &&
+      fileSearchText(file).includes(filter)
+    ))
+    .sort((a, b) => fileSortKey(a).localeCompare(fileSortKey(b), "ko-KR"));
 
   if (!rows.length) {
     els.filesTable.innerHTML =
@@ -126,9 +244,9 @@ function renderFiles() {
       const selected = file.relativePath === state.selectedPath ? " selected" : "";
       return `
         <tr class="${selected}" data-path="${escapeHtml(file.relativePath)}" data-deleted="${file.deleted}">
-          <td class="path-cell">
-            <strong>${escapeHtml(file.relativePath)}</strong>
-            <span>리비전 ${escapeHtml(file.revision ?? "-")} · ${formatBytes(file.size)} · ${formatDate(file.serverUpdatedAt)}</span>
+          <td class="note-cell">
+            <strong>${escapeHtml(fileTitle(file))}</strong>
+            <span>${escapeHtml(fileFolder(file))} · 리비전 ${escapeHtml(file.revision ?? "-")} · ${formatBytes(file.size)} · ${formatDate(file.serverUpdatedAt)}</span>
           </td>
           <td><span class="${pillClass}">${status}</span></td>
         </tr>
@@ -155,12 +273,59 @@ function renderSelectedFileMeta(file = selectedFile()) {
 
   const status = file.deleted ? "삭제됨" : "활성";
   const pillClass = file.deleted ? "status-pill deleted" : "status-pill";
+  els.previewPath.textContent = fileTitle(file);
   els.selectedFileMeta.innerHTML = `
     <span class="${pillClass}">${status}</span>
+    <span>${escapeHtml(fileFolder(file))}</span>
     <span>리비전 ${escapeHtml(file.revision ?? "-")}</span>
     <span>${formatBytes(file.size)}</span>
     <span>${formatDate(file.serverUpdatedAt)}</span>
   `;
+}
+
+function renderAttachments(file = selectedFile()) {
+  if (!state.selectedPath) {
+    state.selectedAttachmentPath = null;
+    revokeSelectedAttachmentUrl();
+    els.attachmentsStatus.textContent = "파일을 선택하면 첨부 목록이 표시됩니다.";
+    els.attachmentList.innerHTML = '<div class="attachment-empty">첨부 없음</div>';
+    return;
+  }
+
+  const attachments = attachmentsForFile(file);
+  if (!attachments.length) {
+    state.selectedAttachmentPath = null;
+    revokeSelectedAttachmentUrl();
+    els.attachmentsStatus.textContent = "첨부된 파일이 없습니다.";
+    els.attachmentList.innerHTML = '<div class="attachment-empty">첨부 없음</div>';
+    return;
+  }
+
+  if (
+    state.selectedAttachmentPath &&
+    !attachments.some((item) => item.relativePath === state.selectedAttachmentPath)
+  ) {
+    state.selectedAttachmentPath = null;
+    revokeSelectedAttachmentUrl();
+  }
+
+  els.attachmentsStatus.textContent = `${attachments.length}개 첨부`;
+  els.attachmentList.innerHTML = attachments
+    .map((attachment) => {
+      const selected = attachment.relativePath === state.selectedAttachmentPath
+        ? " selected"
+        : "";
+      return `
+        <div class="attachment-item${selected}">
+          <button class="attachment-select" type="button" data-attachment-view="${escapeHtml(attachment.relativePath)}">
+            <strong>${escapeHtml(attachmentTitle(attachment))}</strong>
+            <span>${escapeHtml(attachmentTypeLabel(attachment))} · ${formatBytes(attachment.size)}</span>
+          </button>
+          <button class="attachment-download" type="button" data-attachment-download="${escapeHtml(attachment.relativePath)}">다운로드</button>
+        </div>
+      `;
+    })
+    .join("");
 }
 
 function renderClients(clients) {
@@ -208,8 +373,6 @@ function renderClients(clients) {
 }
 
 function renderTokens(tokens) {
-  els.tokenCount.textContent = tokens.length;
-
   if (!tokens.length) {
     els.tokensTable.innerHTML =
       '<tr class="empty-row"><td colspan="5">발급된 토큰이 없습니다.</td></tr>';
@@ -348,18 +511,23 @@ async function loadManifest() {
   }
   state.manifest = manifest;
   state.files = manifest.files || [];
+  state.attachments = manifest.attachments || [];
   state.tokens = tokenPayload.tokens || [];
   if (
     state.selectedPath &&
     !state.files.some((file) => file.relativePath === state.selectedPath)
   ) {
     state.selectedPath = null;
+    state.selectedAttachmentPath = null;
+    revokeSelectedAttachmentUrl();
     state.selectedHistoryCommit = null;
     state.history = [];
   }
   renderSummary(manifest);
+  renderFolderFilter();
   renderFiles();
   renderSelectedFileMeta();
+  renderAttachments();
   renderHistory();
   renderClients(manifest.clients);
   renderTokens(state.tokens);
@@ -373,9 +541,12 @@ async function loadFile(relativePath) {
   const file = state.files.find((item) => item.relativePath === relativePath);
   renderFiles();
   renderSelectedFileMeta(file);
+  state.selectedAttachmentPath = null;
+  revokeSelectedAttachmentUrl();
+  renderAttachments(file);
   renderHistory();
 
-  els.previewPath.textContent = relativePath;
+  els.previewPath.textContent = fileTitle(file);
   els.historyStatus.textContent = "Git 이력 조회 중";
   const historyPromise = loadFileHistory(relativePath);
 
@@ -400,7 +571,7 @@ async function loadFileHistory(relativePath) {
 async function loadFileVersion(relativePath, commit) {
   state.selectedHistoryCommit = commit;
   renderHistory();
-  els.previewPath.textContent = `${relativePath} @ ${shortTokenId(commit)}`;
+  els.previewPath.textContent = `${fileTitle(selectedFile())} @ ${shortTokenId(commit)}`;
   els.preview.textContent = "버전 조회 중";
 
   const payload = await requestJson(
@@ -412,6 +583,108 @@ async function loadFileVersion(relativePath, commit) {
     els.preview.textContent = decodeBase64Text(payload.content);
   }
   renderHistory();
+}
+
+async function loadAttachmentView(relativePath) {
+  const attachment = state.attachments.find((item) => item.relativePath === relativePath);
+  if (!attachment || attachment.deleted) {
+    openAttachmentModalShell({
+      title: "첨부 미리보기",
+      meta: "선택한 첨부 정보를 찾을 수 없습니다.",
+      relativePath: "",
+    });
+    els.attachmentModalBody.textContent = "선택한 첨부 정보를 찾을 수 없습니다.";
+    return;
+  }
+
+  state.selectedAttachmentPath = relativePath;
+  renderAttachments(selectedFile());
+  revokeSelectedAttachmentUrl();
+  openAttachmentModalShell({
+    title: attachmentTitle(attachment),
+    meta: `${attachmentTypeLabel(attachment)} · ${formatBytes(attachment.size)}`,
+    relativePath,
+  });
+  els.attachmentModalBody.textContent = "첨부 조회 중";
+
+  const payload = await requestJson(`/api/attachments/${encodePath(relativePath)}`);
+  const blob = attachmentBlob(payload);
+  const objectUrl = URL.createObjectURL(blob);
+  state.selectedAttachmentObjectUrl = objectUrl;
+  els.attachmentModalDownload.disabled = false;
+  els.attachmentModalDownload.dataset.attachmentDownload = relativePath;
+  els.attachmentModalMeta.textContent = `${payload.mimeType || "application/octet-stream"} · ${formatBytes(payload.size)}`;
+
+  if (isImageAttachment(payload)) {
+    els.attachmentModalBody.innerHTML = `
+      <img src="${objectUrl}" alt="${escapeHtml(attachmentTitle(payload))}">
+      <div class="attachment-viewer-meta">
+        ${escapeHtml(payload.mimeType || "image")} · ${formatBytes(payload.size)}
+      </div>
+    `;
+    return;
+  }
+
+  if (isTextAttachment(payload)) {
+    els.attachmentModalBody.innerHTML = `
+      <pre class="attachment-text-preview">${escapeHtml(decodeBase64Text(payload.content))}</pre>
+    `;
+    return;
+  }
+
+  els.attachmentModalBody.innerHTML = `
+    <div class="attachment-download-state">
+      <strong>${escapeHtml(attachmentTitle(payload))}</strong>
+      <span>${escapeHtml(payload.mimeType || "application/octet-stream")} · ${formatBytes(payload.size)}</span>
+      <button type="button" data-attachment-download="${escapeHtml(relativePath)}">다운로드</button>
+    </div>
+  `;
+}
+
+function openAttachmentModalShell({ title, meta, relativePath }) {
+  els.attachmentModalTitle.textContent = title || "첨부 미리보기";
+  els.attachmentModalMeta.textContent = meta || "";
+  els.attachmentModalDownload.disabled = true;
+  if (relativePath) {
+    els.attachmentModalDownload.dataset.attachmentDownload = relativePath;
+  } else {
+    delete els.attachmentModalDownload.dataset.attachmentDownload;
+  }
+  els.attachmentModal.hidden = false;
+  document.body.classList.add("modal-open");
+}
+
+function closeAttachmentModal() {
+  els.attachmentModal.hidden = true;
+  revokeSelectedAttachmentUrl();
+  if (els.accountModal.hidden) {
+    document.body.classList.remove("modal-open");
+  }
+}
+
+async function downloadAttachment(relativePath) {
+  const payload = await requestJson(`/api/attachments/${encodePath(relativePath)}`);
+  const blob = attachmentBlob(payload);
+  const objectUrl = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = objectUrl;
+  link.download = attachmentTitle(payload);
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  URL.revokeObjectURL(objectUrl);
+}
+
+function attachmentBlob(payload) {
+  return new Blob([decodeBase64Bytes(payload.content)], {
+    type: payload.mimeType || "application/octet-stream",
+  });
+}
+
+function revokeSelectedAttachmentUrl() {
+  if (!state.selectedAttachmentObjectUrl) return;
+  URL.revokeObjectURL(state.selectedAttachmentObjectUrl);
+  state.selectedAttachmentObjectUrl = null;
 }
 
 async function rollbackSelectedVersion() {
@@ -430,8 +703,11 @@ async function rollbackSelectedVersion() {
 }
 
 function decodeBase64Text(content) {
-  const raw = Uint8Array.from(atob(content || ""), (char) => char.charCodeAt(0));
-  return new TextDecoder("utf-8").decode(raw);
+  return new TextDecoder("utf-8").decode(decodeBase64Bytes(content));
+}
+
+function decodeBase64Bytes(content) {
+  return Uint8Array.from(atob(content || ""), (char) => char.charCodeAt(0));
 }
 
 async function logout() {
@@ -555,6 +831,7 @@ els.menuButtons.forEach((button) => {
   button.addEventListener("click", () => setActiveSection(button.dataset.adminSection));
 });
 els.fileFilter.addEventListener("input", renderFiles);
+els.folderFilter.addEventListener("change", renderFiles);
 els.rollbackButton.addEventListener("click", () => {
   rollbackSelectedVersion().catch((error) => setStatus(error.message));
 });
@@ -563,6 +840,25 @@ els.filesTable.addEventListener("click", (event) => {
   if (!row) return;
   loadFile(row.dataset.path).catch((error) => {
     els.preview.textContent = error.message;
+  });
+});
+document.addEventListener("click", (event) => {
+  const viewButton = event.target.closest("[data-attachment-view]");
+  if (viewButton) {
+    loadAttachmentView(viewButton.dataset.attachmentView).catch((error) => {
+      els.attachmentModalBody.textContent = error.message;
+    });
+    return;
+  }
+
+  const downloadButton = event.target.closest("[data-attachment-download]");
+  if (!downloadButton || downloadButton.disabled) return;
+  downloadAttachment(downloadButton.dataset.attachmentDownload).catch((error) => {
+    if (!els.attachmentModal.hidden) {
+      els.attachmentModalBody.textContent = error.message;
+    } else {
+      setStatus(error.message);
+    }
   });
 });
 els.historyTable.addEventListener("click", (event) => {
@@ -581,8 +877,16 @@ els.accountForm.addEventListener("submit", saveAccount);
 document.querySelectorAll("[data-account-close]").forEach((button) => {
   button.addEventListener("click", closeAccountModal);
 });
+document.querySelectorAll("[data-attachment-close]").forEach((button) => {
+  button.addEventListener("click", closeAttachmentModal);
+});
 document.addEventListener("keydown", (event) => {
-  if (event.key === "Escape" && !els.accountModal.hidden) {
+  if (event.key !== "Escape") return;
+  if (!els.attachmentModal.hidden) {
+    closeAttachmentModal();
+    return;
+  }
+  if (!els.accountModal.hidden) {
     closeAccountModal();
   }
 });
