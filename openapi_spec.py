@@ -443,6 +443,9 @@ def build_openapi_spec(server_url):
                         "Compares client metadata with server metadata and returns "
                         "note file and note attachment upload, download, delete, and "
                         "conflict targets. This endpoint does not upload file content. "
+                        "Missing client metadata is treated as a download target unless "
+                        "knownFiles or knownAttachments explicitly marks that path as "
+                        "deleted. "
                         "Clients should include note attachment metadata with "
                         "SHA-256 contentHash values so the server can skip unchanged "
                         "attachment uploads before content transfer."
@@ -530,7 +533,8 @@ def build_openapi_spec(server_url):
                     "description": (
                         "Used for a file-save event or for files selected by "
                         "/api/sync/plan. The server updates the file record and "
-                        "merges the supplied note/workspace metadata."
+                        "merges the supplied note/workspace metadata. Delete requests "
+                        "must include lastKnownRevision."
                     ),
                     "security": [{"bearerAuth": []}],
                     "requestBody": {
@@ -1162,6 +1166,14 @@ def build_openapi_spec(server_url):
                         "lastKnownRevision": {"type": "integer", "minimum": 0},
                         "contentHash": {"type": "string"},
                         "updatedAtMs": {"type": "integer"},
+                        "deleted": {
+                            "type": "boolean",
+                            "default": False,
+                            "description": (
+                                "Set true only for an explicit client tombstone. "
+                                "Omitted known files are not interpreted as deletes."
+                            ),
+                        },
                     },
                     "additionalProperties": False,
                 },
@@ -1285,8 +1297,10 @@ def build_openapi_spec(server_url):
                         "knownFiles": {
                             "type": "array",
                             "description": (
-                                "Optional client-side file sync state. When omitted, "
-                                "baseRevision is used for every file."
+                                "Optional client-side file sync state. Missing entries "
+                                "are treated as unknown bootstrap state, not server "
+                                "deletes. To request server deletion from a plan, include "
+                                "the path with deleted=true and lastKnownRevision."
                             ),
                             "items": {"$ref": "#/components/schemas/KnownFile"},
                             "default": [],
@@ -1296,7 +1310,8 @@ def build_openapi_spec(server_url):
                             "description": (
                                 "Client-side note attachment sync state. Include "
                                 "contentHash values from the previous manifest so "
-                                "/api/sync/plan can skip unchanged attachment uploads."
+                                "/api/sync/plan can skip unchanged attachment uploads. "
+                                "Use deleted=true only for explicit attachment tombstones."
                             ),
                             "items": {"$ref": "#/components/schemas/KnownAttachment"},
                             "default": [],

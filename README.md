@@ -134,9 +134,13 @@ Authorization: Bearer <accessToken>
 
 1. 클라이언트가 `/api/login`으로 로그인하고 `accessToken`을 저장합니다.
 2. 전체 동기화가 필요하면 `/api/sync/plan`에 로컬 `metadata.json`과 `knownFiles`를 보냅니다.
+   새 기기처럼 서버 파일을 아직 내려받지 않은 상태에서는 `knownFiles`를 비우거나
+   `deleted`를 생략하세요. 서버는 metadata에 없다는 이유만으로 서버 파일을 삭제하지 않습니다.
 3. 응답의 `plan.uploadFiles`는 `/api/sync/file`로 업로드합니다.
 4. 응답의 `plan.downloadFiles`는 `/api/files/{relativePath}`로 다운로드합니다.
 5. 응답의 `plan.deleteServerFiles`는 서버 삭제로, `plan.deleteLocalFiles`는 로컬 삭제로 반영합니다.
+   서버 삭제를 계획으로 요청하려면 해당 `knownFiles` 항목에 `deleted: true`와
+   `lastKnownRevision`을 명시하거나 `/api/sync/file`에 `deleted: true`를 보내세요.
 6. 각 처리 후 응답의 `manifest.serverRevision`과 파일별 `revision`을 로컬 동기화 상태에 저장합니다.
 7. `plan.conflicts`가 있으면 자동 덮어쓰기 대신 사용자 선택 또는 병합 UI를 거칩니다.
 8. 파일 저장 이벤트가 발생하면 전체 동기화를 기다리지 않고 `/api/sync/file`로 해당 파일만 업로드할 수 있습니다.
@@ -208,6 +212,16 @@ Authorization: Bearer <accessToken>
   "lastKnownRevision": 3,
   "deleted": true,
   "updatedAtMs": 1780030055707
+}
+```
+
+계획에서 서버 삭제를 명시하는 `knownFiles` tombstone:
+
+```json
+{
+  "relativePath": "memo/old.md",
+  "lastKnownRevision": 3,
+  "deleted": true
 }
 ```
 
@@ -354,9 +368,15 @@ Authorization: Bearer <accessToken>
 
 1. Log in with `/api/login` and store the `accessToken`.
 2. For a full sync, send local `metadata.json` and `knownFiles` to `/api/sync/plan`.
+   On a new device that has not downloaded server files yet, leave `knownFiles`
+   empty or omit `deleted`; missing client metadata is not treated as a server
+   delete.
 3. Upload `plan.uploadFiles` with `/api/sync/file`.
 4. Download `plan.downloadFiles` with `/api/files/{relativePath}`.
 5. Apply `plan.deleteServerFiles` on the server side and `plan.deleteLocalFiles` locally.
+   To request a server delete from planning, include the path in `knownFiles`
+   with `deleted: true` and `lastKnownRevision`, or call `/api/sync/file` with
+   `deleted: true`.
 6. Store `manifest.serverRevision` and each file `revision` in the client's sync state.
 7. If `plan.conflicts` is not empty, ask the user to choose or merge instead of overwriting automatically.
 8. On file-save events, upload the changed file directly with `/api/sync/file`.
@@ -428,6 +448,16 @@ File delete:
   "lastKnownRevision": 3,
   "deleted": true,
   "updatedAtMs": 1780030055707
+}
+```
+
+`knownFiles` tombstone for planned server delete:
+
+```json
+{
+  "relativePath": "memo/old.md",
+  "lastKnownRevision": 3,
+  "deleted": true
 }
 ```
 

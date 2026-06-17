@@ -182,10 +182,36 @@ class SyncStore:
             current_revision = current.get("revision", 0) if current else 0
             current_deleted = bool(current and current.get("deleted"))
             current_hash = current.get("contentHash") if current else None
+            note_snapshot = current.get("deletedNote") if current else None
+            metadata_note_snapshot = self._note_snapshot_from_metadata(relative_path)
+            if note_snapshot is None:
+                note_snapshot = metadata_note_snapshot
             target_hash = sha256_bytes(content) if content is not None else None
 
+            now = utc_now()
+            updated_at_ms = utc_now_ms()
             if content is None:
                 if current_deleted:
+                    metadata_result = self._sync_rollback_metadata(
+                        state,
+                        relative_path,
+                        deleted=True,
+                        now=now,
+                        updated_at_ms=updated_at_ms,
+                    )
+                    if metadata_result["status"] != "unchanged":
+                        state["updatedAt"] = now
+                        atomic_write_json(self.state_path, state)
+                        return {
+                            "status": "accepted",
+                            "relativePath": relative_path,
+                            "revision": current_revision,
+                            "serverRevision": state["serverRevision"],
+                            "deleted": True,
+                            "rolledBackToCommit": commit,
+                            "metadata": metadata_result,
+                            "manifest": self._manifest_from_state(state),
+                        }
                     return {
                         "status": "unchanged",
                         "relativePath": relative_path,
@@ -198,6 +224,33 @@ class SyncStore:
                     file_path.unlink()
             else:
                 if not current_deleted and current_hash == target_hash:
+                    if metadata_note_snapshot is None:
+                        metadata_result = self._sync_rollback_metadata(
+                            state,
+                            relative_path,
+                            deleted=False,
+                            now=now,
+                            updated_at_ms=updated_at_ms,
+                            note_snapshot=note_snapshot,
+                            restored_content=content,
+                        )
+                        if metadata_result["status"] != "unchanged":
+                            state["updatedAt"] = now
+                            atomic_write_json(self.state_path, state)
+                            return {
+                                "status": "accepted",
+                                "relativePath": relative_path,
+                                "revision": current_revision,
+                                "serverRevision": state["serverRevision"],
+                                "contentHash": target_hash,
+                                "deleted": False,
+                                "gitCommit": (
+                                    current.get("gitCommit") if current else None
+                                ),
+                                "rolledBackToCommit": commit,
+                                "metadata": metadata_result,
+                                "manifest": self._manifest_from_state(state),
+                            }
                     return {
                         "status": "unchanged",
                         "relativePath": relative_path,
@@ -208,7 +261,6 @@ class SyncStore:
                     }
                 atomic_write_bytes(self._file_path(relative_path), content)
 
-            now = utc_now()
             state["serverRevision"] += 1
             file_revision = state["serverRevision"]
             message = f"Rollback {relative_path} to {commit[:12]}"
@@ -224,6 +276,8 @@ class SyncStore:
                     "gitCommit": git_commit,
                     "rolledBackToGitCommit": commit,
                 }
+                if note_snapshot:
+                    state["files"][relative_path]["deletedNote"] = note_snapshot
             else:
                 state["files"][relative_path] = {
                     "revision": file_revision,
@@ -241,7 +295,9 @@ class SyncStore:
                 relative_path,
                 deleted=content is None,
                 now=now,
-                updated_at_ms=utc_now_ms(),
+                updated_at_ms=updated_at_ms,
+                note_snapshot=note_snapshot,
+                restored_content=content,
             )
             state["updatedAt"] = now
             atomic_write_json(self.state_path, state)
@@ -447,12 +503,33 @@ class SyncStore:
             metadata_result = None
             now = utc_now()
 
+            metadata_deleted_file_paths = set()
+            for item in files:
+                if not isinstance(item, dict):
+                    continue
+
+                relative_path = normalize_relative_path(item.get("relativePath"))
+                deleted = self._to_bool(
+                    item.get("deleted"),
+                    f"{relative_path}.deleted",
+                )
+                if not deleted or "lastKnownRevision" not in item:
+                    continue
+
+                current = state["files"].get(relative_path)
+                last_known_revision = self._to_int(
+                    item.get("lastKnownRevision"),
+                    f"{relative_path}.lastKnownRevision",
+                )
+                if current and current.get("revision", 0) <= last_known_revision:
+                    metadata_deleted_file_paths.add(relative_path)
             if "metadata" in payload:
                 metadata_result = self._sync_metadata(
                     state,
                     payload["metadata"],
                     base_revision,
                     now,
+                    allowed_removed_file_paths=metadata_deleted_file_paths,
                 )
 
             for item in files:
@@ -572,7 +649,14 @@ class SyncStore:
 
         return cleaned or None
 
-    def _sync_metadata(self, state, metadata_payload, base_revision, now):
+    def _sync_metadata(
+        self,
+        state,
+        metadata_payload,
+        base_revision,
+        now,
+        allowed_removed_file_paths=None,
+    ):
         if metadata_payload is None:
             return None
 
@@ -598,6 +682,21 @@ class SyncStore:
                 "status": "unchanged",
                 "revision": current.get("revision", 0),
                 "contentHash": current.get("contentHash"),
+            }
+
+        orphaned_paths = self._metadata_orphaned_active_file_paths(
+            state,
+            body,
+            allowed_removed_file_paths,
+        )
+        if orphaned_paths:
+            return {
+                "status": "conflict",
+                "reason": "metadata_removes_existing_server_files",
+                "revision": current.get("revision", 0),
+                "contentHash": current.get("contentHash"),
+                "orphanedFiles": orphaned_paths,
+                "serverMetadata": self._read_metadata_body(),
             }
 
         state["serverRevision"] += 1
@@ -646,7 +745,11 @@ class SyncStore:
             raise SyncError("Each file sync item must be an object.")
 
         relative_path = normalize_relative_path(item.get("relativePath"))
-        deleted = bool(item.get("deleted", False))
+        deleted = self._to_bool(item.get("deleted"), f"{relative_path}.deleted")
+        if deleted and "lastKnownRevision" not in item:
+            raise SyncError(
+                f"{relative_path}.lastKnownRevision is required when deleted is true."
+            )
         last_known_revision = self._to_int(
             item.get("lastKnownRevision", base_revision),
             f"{relative_path}.lastKnownRevision",
@@ -887,7 +990,7 @@ class SyncStore:
 
     def _sync_file_metadata(self, state, payload, now):
         relative_path = normalize_relative_path(payload.get("relativePath"))
-        deleted = bool(payload.get("deleted", False))
+        deleted = self._to_bool(payload.get("deleted"), f"{relative_path}.deleted")
         note = payload.get("note")
         workspace = payload.get("workspace")
 
@@ -902,6 +1005,14 @@ class SyncStore:
         changed = False
 
         if deleted:
+            deleted_note = self._note_for_update(
+                metadata,
+                relative_path,
+                create=False,
+            )
+            record = state["files"].get(relative_path)
+            if deleted_note and isinstance(record, dict):
+                record["deletedNote"] = dict(deleted_note)
             changed = self._remove_note(metadata, relative_path)
         else:
             if workspace:
@@ -1054,12 +1165,20 @@ class SyncStore:
         deleted,
         now,
         updated_at_ms,
+        note_snapshot=None,
+        restored_content=None,
     ):
         metadata = self._read_metadata_body() or self._empty_metadata()
         if deleted:
             changed = self._remove_note(metadata, relative_path)
         else:
-            changed = self._touch_note(metadata, relative_path, updated_at_ms)
+            changed = self._restore_note_metadata(
+                metadata,
+                relative_path,
+                updated_at_ms,
+                note_snapshot=note_snapshot,
+                restored_content=restored_content,
+            )
 
         if not changed:
             return {
@@ -1082,6 +1201,99 @@ class SyncStore:
             "revision": state["serverRevision"],
             "contentHash": content_hash,
         }
+
+    def _restore_note_metadata(
+        self,
+        metadata,
+        relative_path,
+        updated_at_ms,
+        note_snapshot=None,
+        restored_content=None,
+    ):
+        notes = metadata.setdefault("notes", [])
+        for note in notes:
+            if not isinstance(note, dict):
+                continue
+            try:
+                note_path = normalize_relative_path(note.get("relativePath"))
+            except SyncError:
+                continue
+            if note_path != relative_path:
+                continue
+            if note.get("updatedAtMs") == updated_at_ms:
+                return False
+            note["updatedAtMs"] = updated_at_ms
+            return True
+
+        restored_note = self._note_from_snapshot_or_content(
+            relative_path,
+            updated_at_ms,
+            note_snapshot=note_snapshot,
+            content=restored_content,
+        )
+        workspace_id = restored_note.get("workspace")
+        if workspace_id and workspace_id not in self._workspaces_by_id(metadata):
+            self._upsert_workspace(
+                metadata,
+                {
+                    "id": workspace_id,
+                    "name": restored_note.get("workspaceName") or workspace_id,
+                },
+            )
+        return self._upsert_note(metadata, restored_note)
+
+    def _note_from_snapshot_or_content(
+        self,
+        relative_path,
+        updated_at_ms=None,
+        note_snapshot=None,
+        content=None,
+    ):
+        note = dict(note_snapshot) if isinstance(note_snapshot, dict) else {}
+        note["relativePath"] = relative_path
+        note.setdefault("fileName", PurePosixPath(relative_path).name)
+
+        folder = str(PurePosixPath(relative_path).parent)
+        if folder != ".":
+            note.setdefault("folder", folder)
+            workspace_id = folder.split("/", 1)[0]
+            note.setdefault("workspace", workspace_id)
+            note.setdefault("workspaceName", workspace_id)
+
+        if updated_at_ms is not None:
+            note["updatedAtMs"] = updated_at_ms
+
+        if not note.get("title"):
+            note["title"] = (
+                self._markdown_title(content)
+                or PurePosixPath(relative_path).stem
+            )
+
+        if note.get("workspace") and not note.get("workspaceName"):
+            note["workspaceName"] = note.get("workspace")
+
+        return {key: value for key, value in note.items() if value is not None}
+
+    def _note_snapshot_from_metadata(self, relative_path):
+        metadata = self._read_metadata_body() or self._empty_metadata()
+        note = self._notes_by_path(metadata).get(relative_path)
+        return dict(note) if isinstance(note, dict) else None
+
+    def _markdown_title(self, content):
+        if not content:
+            return None
+        try:
+            text = content.decode("utf-8")
+        except UnicodeDecodeError:
+            return None
+        for line in text.splitlines():
+            stripped = line.strip()
+            if not stripped.startswith("#"):
+                continue
+            title = stripped.lstrip("#").strip()
+            if title:
+                return title
+        return None
 
     def _touch_note(self, metadata, relative_path, updated_at_ms):
         notes = metadata.setdefault("notes", [])
@@ -1133,6 +1345,7 @@ class SyncStore:
             if not isinstance(item, dict):
                 raise SyncError(f"Each {field_name} item must be an object.")
             relative_path = normalize_relative_path(item.get("relativePath"))
+            deleted = self._to_bool(item.get("deleted"), f"{relative_path}.deleted")
             by_path[relative_path] = {
                 "lastKnownRevision": self._to_int(
                     item.get("lastKnownRevision", base_revision),
@@ -1140,6 +1353,7 @@ class SyncStore:
                 ),
                 "contentHash": item.get("contentHash"),
                 "updatedAtMs": item.get("updatedAtMs"),
+                "deleted": deleted,
             }
         return by_path
 
@@ -1186,6 +1400,7 @@ class SyncStore:
             last_known_revision = known.get("lastKnownRevision", base_revision)
             server_revision = record.get("revision", 0) if record else 0
             server_deleted = bool(record and record.get("deleted"))
+            client_delete_requested = self._known_delete_requested(known)
 
             if not client_note and not server_note:
                 if server_deleted:
@@ -1198,7 +1413,27 @@ class SyncStore:
                             )
                         )
                 elif record:
-                    if server_revision > last_known_revision or base_revision == 0:
+                    if client_delete_requested and server_revision <= last_known_revision:
+                        plan["deleteServerFiles"].append(
+                            self._delete_plan_item(
+                                relative_path,
+                                "client_deleted_file",
+                                record,
+                            )
+                        )
+                    elif client_delete_requested:
+                        plan["conflicts"].append(
+                            self._conflict_plan_item(
+                                relative_path,
+                                "server_file_changed_after_client_delete",
+                                None,
+                                None,
+                                record,
+                                client_workspaces,
+                                server_workspaces,
+                            )
+                        )
+                    else:
                         plan["downloadFiles"].append(
                             self._download_plan_item(
                                 relative_path,
@@ -1206,14 +1441,6 @@ class SyncStore:
                                 None,
                                 record,
                                 server_workspaces,
-                            )
-                        )
-                    else:
-                        plan["deleteServerFiles"].append(
-                            self._delete_plan_item(
-                                relative_path,
-                                "missing_in_client_metadata",
-                                record,
                             )
                         )
                 continue
@@ -1267,7 +1494,28 @@ class SyncStore:
                         )
                     continue
 
-                if server_revision > last_known_revision or base_revision == 0:
+                if client_delete_requested and server_revision <= last_known_revision:
+                    plan["deleteServerFiles"].append(
+                        self._delete_plan_item(
+                            relative_path,
+                            "client_deleted_file",
+                            record,
+                            server_note,
+                        )
+                    )
+                elif client_delete_requested:
+                    plan["conflicts"].append(
+                        self._conflict_plan_item(
+                            relative_path,
+                            "server_file_changed_after_client_delete",
+                            None,
+                            server_note,
+                            record,
+                            client_workspaces,
+                            server_workspaces,
+                        )
+                    )
+                else:
                     plan["downloadFiles"].append(
                         self._download_plan_item(
                             relative_path,
@@ -1275,15 +1523,6 @@ class SyncStore:
                             server_note,
                             record,
                             server_workspaces,
-                        )
-                    )
-                else:
-                    plan["deleteServerFiles"].append(
-                        self._delete_plan_item(
-                            relative_path,
-                            "missing_in_client_metadata",
-                            record,
-                            server_note,
                         )
                     )
                 continue
@@ -1439,6 +1678,7 @@ class SyncStore:
             server_deleted = bool(record and record.get("deleted"))
             client_hash = self._attachment_metadata_hash(client_attachment)
             known_hash = known.get("contentHash")
+            client_delete_requested = self._known_delete_requested(known)
 
             if not client_attachment and not server_attachment:
                 if server_deleted and server_revision > last_known_revision:
@@ -1450,20 +1690,30 @@ class SyncStore:
                         )
                     )
                 elif record and not server_deleted:
-                    if server_revision > last_known_revision or base_revision == 0:
-                        plan["downloadAttachments"].append(
-                            self._attachment_download_plan_item(
+                    if client_delete_requested and server_revision <= last_known_revision:
+                        plan["deleteServerAttachments"].append(
+                            self._attachment_delete_plan_item(
                                 relative_path,
-                                "server_attachment_without_metadata",
+                                "client_deleted_attachment",
+                                record,
+                            )
+                        )
+                    elif client_delete_requested:
+                        plan["conflicts"].append(
+                            self._attachment_conflict_plan_item(
+                                relative_path,
+                                "server_attachment_changed_after_client_delete",
+                                client_entry,
                                 server_entry,
                                 record,
                             )
                         )
                     else:
-                        plan["deleteServerAttachments"].append(
-                            self._attachment_delete_plan_item(
+                        plan["downloadAttachments"].append(
+                            self._attachment_download_plan_item(
                                 relative_path,
-                                "missing_in_client_metadata",
+                                "server_attachment_without_metadata",
+                                server_entry,
                                 record,
                             )
                         )
@@ -1530,22 +1780,32 @@ class SyncStore:
                         )
                     continue
 
-                if server_revision > last_known_revision or base_revision == 0:
+                if client_delete_requested and server_revision <= last_known_revision:
+                    plan["deleteServerAttachments"].append(
+                        self._attachment_delete_plan_item(
+                            relative_path,
+                            "client_deleted_attachment",
+                            record,
+                            server_entry,
+                        )
+                    )
+                elif client_delete_requested:
+                    plan["conflicts"].append(
+                        self._attachment_conflict_plan_item(
+                            relative_path,
+                            "server_attachment_changed_after_client_delete",
+                            client_entry,
+                            server_entry,
+                            record,
+                        )
+                    )
+                else:
                     plan["downloadAttachments"].append(
                         self._attachment_download_plan_item(
                             relative_path,
                             "missing_on_client",
                             server_entry,
                             record,
-                        )
-                    )
-                else:
-                    plan["deleteServerAttachments"].append(
-                        self._attachment_delete_plan_item(
-                            relative_path,
-                            "missing_in_client_metadata",
-                            record,
-                            server_entry,
                         )
                     )
                 continue
@@ -1619,6 +1879,34 @@ class SyncStore:
             )
 
         return plan
+
+    def _metadata_orphaned_active_file_paths(
+        self,
+        state,
+        metadata,
+        allowed_removed_file_paths=None,
+    ):
+        active_file_paths = {
+            relative_path
+            for relative_path, record in state["files"].items()
+            if not record.get("deleted") and not self._is_attachment_record(record)
+        }
+        if not active_file_paths:
+            return []
+
+        current_metadata = self._read_metadata_body() or self._empty_metadata()
+        current_note_paths = set(self._notes_by_path(current_metadata))
+        next_note_paths = set(self._notes_by_path(metadata))
+        allowed_removed_file_paths = set(allowed_removed_file_paths or [])
+        orphaned_paths = (
+            (current_note_paths & active_file_paths)
+            - next_note_paths
+            - allowed_removed_file_paths
+        )
+        return sorted(orphaned_paths)
+
+    def _known_delete_requested(self, known):
+        return bool(known and known.get("deleted"))
 
     def _known_file_changed(self, record, known):
         known_hash = known.get("contentHash")
@@ -2137,9 +2425,21 @@ class SyncStore:
                 attachments.append(attachment_record)
             else:
                 file_record = {"relativePath": relative_path, **record}
-                note_record = self._manifest_note_record(
-                    notes_by_path.get(relative_path)
-                )
+                note = notes_by_path.get(relative_path) or record.get("deletedNote")
+                if not note and not record.get("deleted"):
+                    content = None
+                    file_path = self._file_path(relative_path)
+                    if file_path.exists():
+                        try:
+                            content = file_path.read_bytes()
+                        except OSError:
+                            content = None
+                    note = self._note_from_snapshot_or_content(
+                        relative_path,
+                        record.get("clientUpdatedAtMs"),
+                        content=content,
+                    )
+                note_record = self._manifest_note_record(note)
                 if note_record:
                     file_record["note"] = note_record
                 files.append(file_record)
@@ -2380,6 +2680,13 @@ class SyncStore:
             return int(value)
         except (TypeError, ValueError) as exc:
             raise SyncError(f"{field_name} must be an integer.") from exc
+
+    def _to_bool(self, value, field_name, default=False):
+        if value is None:
+            return default
+        if isinstance(value, bool):
+            return value
+        raise SyncError(f"{field_name} must be a boolean.")
 
     def _metadata_conflicted(self, metadata_result):
         return metadata_result is not None and metadata_result.get("status") == "conflict"

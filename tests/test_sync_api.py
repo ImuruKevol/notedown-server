@@ -412,6 +412,206 @@ class SyncApiTest(unittest.TestCase):
         )
         self.assertTrue(changed_plan["uploadAttachments"][0]["contentRequired"])
 
+    def test_new_client_empty_metadata_downloads_instead_of_deleting_server_files(self):
+        note_content = "# synced from mac\n"
+        attachment_content = b"\x89PNG\r\nsynced-attachment"
+        attachment_digest = hashlib.sha256(attachment_content).hexdigest()
+        metadata = self.note_metadata()
+        attachment = self.attachment_metadata(attachment_content)
+        metadata["notes"][0]["attachments"] = [attachment]
+
+        file_upload = self.client.post(
+            "/api/sync/file",
+            headers=self.headers,
+            json={
+                "clientId": "mac-client",
+                "baseRevision": 0,
+                "relativePath": "memo/note.md",
+                "lastKnownRevision": 0,
+                "updatedAtMs": 10,
+                "contentEncoding": "utf-8",
+                "content": note_content,
+                "workspace": {"id": "memo", "name": "memo"},
+                "note": metadata["notes"][0],
+            },
+        ).get_json()
+
+        attachment_upload = self.client.post(
+            "/api/sync/attachment",
+            headers=self.headers,
+            json={
+                "clientId": "mac-client",
+                "baseRevision": file_upload["serverRevision"],
+                "noteRelativePath": "memo/note.md",
+                "relativePath": attachment["relativePath"],
+                "lastKnownRevision": 0,
+                "updatedAtMs": attachment["updatedAtMs"],
+                "contentEncoding": "base64",
+                "content": base64.b64encode(attachment_content).decode("ascii"),
+                "contentHash": attachment_digest,
+                "note": metadata["notes"][0],
+                "attachment": attachment,
+            },
+        ).get_json()
+
+        manifest = attachment_upload["manifest"]
+        manifest_file = manifest["files"][0]
+        manifest_attachment = manifest["attachments"][0]
+
+        plan_response = self.client.post(
+            "/api/sync/plan",
+            headers=self.headers,
+            json={
+                "clientId": "android-new-client",
+                "baseRevision": manifest["serverRevision"],
+                "metadata": {
+                    "lastKnownRevision": manifest["metadata"]["revision"],
+                    "body": {"version": 1, "workspaces": [], "notes": []},
+                },
+                "knownFiles": [
+                    {
+                        "relativePath": manifest_file["relativePath"],
+                        "lastKnownRevision": manifest_file["revision"],
+                        "contentHash": manifest_file["contentHash"],
+                    }
+                ],
+                "knownAttachments": [
+                    {
+                        "relativePath": manifest_attachment["relativePath"],
+                        "lastKnownRevision": manifest_attachment["revision"],
+                        "contentHash": manifest_attachment["contentHash"],
+                    }
+                ],
+            },
+        )
+
+        self.assertEqual(plan_response.status_code, 200)
+        plan = plan_response.get_json()["plan"]
+        self.assertEqual(plan["deleteServerFiles"], [])
+        self.assertEqual(plan["deleteServerAttachments"], [])
+        self.assertEqual(plan["downloadFiles"][0]["relativePath"], "memo/note.md")
+        self.assertEqual(
+            plan["downloadAttachments"][0]["relativePath"],
+            attachment["relativePath"],
+        )
+
+    def test_plan_server_delete_requires_explicit_known_tombstone(self):
+        metadata = self.note_metadata()
+        upload = self.client.post(
+            "/api/sync/file",
+            headers=self.headers,
+            json={
+                "clientId": "client-a",
+                "baseRevision": 0,
+                "relativePath": "memo/note.md",
+                "lastKnownRevision": 0,
+                "updatedAtMs": 10,
+                "contentEncoding": "utf-8",
+                "content": "# hello\n",
+                "workspace": {"id": "memo", "name": "memo"},
+                "note": metadata["notes"][0],
+            },
+        ).get_json()
+
+        plan = self.client.post(
+            "/api/sync/plan",
+            headers=self.headers,
+            json={
+                "clientId": "client-a",
+                "baseRevision": upload["serverRevision"],
+                "metadata": {
+                    "lastKnownRevision": upload["manifest"]["metadata"]["revision"],
+                    "body": {"version": 1, "workspaces": [], "notes": []},
+                },
+                "knownFiles": [
+                    {
+                        "relativePath": "memo/note.md",
+                        "lastKnownRevision": upload["file"]["revision"],
+                        "contentHash": upload["file"]["contentHash"],
+                        "deleted": True,
+                    }
+                ],
+            },
+        ).get_json()["plan"]
+
+        self.assertEqual(plan["downloadFiles"], [])
+        self.assertEqual(plan["deleteServerFiles"][0]["relativePath"], "memo/note.md")
+        self.assertEqual(plan["deleteServerFiles"][0]["reason"], "client_deleted_file")
+
+    def test_metadata_sync_rejects_wiping_notes_for_existing_server_files(self):
+        metadata = self.note_metadata()
+        upload = self.client.post(
+            "/api/sync/file",
+            headers=self.headers,
+            json={
+                "clientId": "client-a",
+                "baseRevision": 0,
+                "relativePath": "memo/note.md",
+                "lastKnownRevision": 0,
+                "updatedAtMs": 10,
+                "contentEncoding": "utf-8",
+                "content": "# hello\n",
+                "workspace": {"id": "memo", "name": "memo"},
+                "note": metadata["notes"][0],
+            },
+        ).get_json()
+
+        wipe = self.client.post(
+            "/api/sync",
+            headers=self.headers,
+            json={
+                "clientId": "android-new-client",
+                "baseRevision": upload["serverRevision"],
+                "metadata": {
+                    "lastKnownRevision": upload["manifest"]["metadata"]["revision"],
+                    "body": {"version": 1, "workspaces": [], "notes": []},
+                },
+                "files": [],
+            },
+        )
+
+        self.assertEqual(wipe.status_code, 200)
+        payload = wipe.get_json()
+        self.assertEqual(payload["status"], "conflict")
+        self.assertEqual(payload["metadata"]["status"], "conflict")
+        self.assertEqual(
+            payload["metadata"]["reason"],
+            "metadata_removes_existing_server_files",
+        )
+        self.assertEqual(payload["metadata"]["orphanedFiles"], ["memo/note.md"])
+
+        manifest = self.client.get("/api/manifest", headers=self.headers).get_json()
+        self.assertEqual(manifest["files"][0]["note"]["title"], "새 노트")
+
+    def test_delete_upload_requires_explicit_last_known_revision(self):
+        response = self.client.post(
+            "/api/sync/file",
+            headers=self.headers,
+            json={
+                "clientId": "client-a",
+                "baseRevision": 10,
+                "relativePath": "memo/note.md",
+                "deleted": True,
+            },
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("lastKnownRevision", response.get_json()["message"])
+
+        string_deleted = self.client.post(
+            "/api/sync/file",
+            headers=self.headers,
+            json={
+                "clientId": "client-a",
+                "relativePath": "memo/note.md",
+                "lastKnownRevision": 1,
+                "deleted": "true",
+            },
+        )
+
+        self.assertEqual(string_deleted.status_code, 400)
+        self.assertIn("must be a boolean", string_deleted.get_json()["message"])
+
     def test_attachment_metadata_only_sync_skips_existing_content_upload(self):
         content = b"report-binary"
         digest = hashlib.sha256(content).hexdigest()
@@ -827,6 +1027,82 @@ class SyncApiTest(unittest.TestCase):
             plan["plan"]["downloadFiles"][0]["relativePath"],
             "memo/note.md",
         )
+
+    def test_rollback_deleted_file_restores_note_metadata_title(self):
+        metadata = self.note_metadata(updated_at_ms=10)
+        metadata["notes"][0]["title"] = "복구할 노트"
+        upload = self.client.post(
+            "/api/sync/file",
+            headers=self.headers,
+            json={
+                "clientId": "client-a",
+                "baseRevision": 0,
+                "relativePath": "memo/note.md",
+                "lastKnownRevision": 0,
+                "updatedAtMs": 10,
+                "contentEncoding": "utf-8",
+                "content": "본문만 있는 노트\n",
+                "workspace": {"id": "memo", "name": "memo"},
+                "note": metadata["notes"][0],
+            },
+        ).get_json()
+
+        deleted = self.client.post(
+            "/api/sync/file",
+            headers=self.headers,
+            json={
+                "clientId": "client-a",
+                "baseRevision": upload["serverRevision"],
+                "relativePath": "memo/note.md",
+                "lastKnownRevision": upload["file"]["revision"],
+                "deleted": True,
+                "updatedAtMs": 20,
+            },
+        ).get_json()
+
+        self.assertEqual(deleted["metadata"]["status"], "accepted")
+        deleted_file = deleted["manifest"]["files"][0]
+        self.assertTrue(deleted_file["deleted"])
+        self.assertEqual(deleted_file["note"]["title"], "복구할 노트")
+
+        commits = self.client.get(
+            "/api/admin/files/memo/note.md/history",
+            headers=self.headers,
+        ).get_json()["commits"]
+        original_commit = commits[-1]["commit"]
+
+        rollback = self.client.post(
+            "/api/admin/files/memo/note.md/rollback",
+            headers=self.headers,
+            json={"commit": original_commit},
+        ).get_json()
+
+        self.assertEqual(rollback["status"], "accepted")
+        self.assertEqual(rollback["metadata"]["status"], "accepted")
+        restored_file = rollback["manifest"]["files"][0]
+        self.assertFalse(restored_file["deleted"])
+        self.assertEqual(restored_file["note"]["title"], "복구할 노트")
+        self.assertEqual(restored_file["note"]["workspaceName"], "memo")
+
+    def test_manifest_synthesizes_note_title_for_active_file_without_metadata(self):
+        self.client.post(
+            "/api/sync/file",
+            headers=self.headers,
+            json={
+                "clientId": "client-a",
+                "baseRevision": 0,
+                "relativePath": "memo/no-metadata.md",
+                "lastKnownRevision": 0,
+                "updatedAtMs": 10,
+                "contentEncoding": "utf-8",
+                "content": "# 제목만 있는 노트\n\n본문\n",
+            },
+        )
+
+        manifest = self.client.get("/api/manifest", headers=self.headers).get_json()
+        file_record = manifest["files"][0]
+        self.assertEqual(file_record["note"]["title"], "제목만 있는 노트")
+        self.assertEqual(file_record["note"]["folder"], "memo")
 
     def test_plan_downloads_file_changed_without_metadata_timestamp(self):
         metadata = self.note_metadata(updated_at_ms=10)
