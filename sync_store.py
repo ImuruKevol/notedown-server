@@ -1,5 +1,6 @@
 import base64
 import binascii
+import copy
 import hashlib
 import json
 import os
@@ -179,26 +180,54 @@ class SyncStore:
             content = self._git_file_content(relative_path, commit)
             state = self._load_state()
             current = state["files"].get(relative_path)
+            is_attachment = self._is_attachment_record(current)
+            metadata_snapshot = self._metadata_snapshot_for_commit(current, commit)
             current_revision = current.get("revision", 0) if current else 0
             current_deleted = bool(current and current.get("deleted"))
             current_hash = current.get("contentHash") if current else None
-            note_snapshot = current.get("deletedNote") if current else None
-            metadata_note_snapshot = self._note_snapshot_from_metadata(relative_path)
-            if note_snapshot is None:
-                note_snapshot = metadata_note_snapshot
+            attachment_snapshot = None
+            if is_attachment:
+                attachment_snapshot = metadata_snapshot.get("attachment")
+                if attachment_snapshot is None:
+                    attachment_snapshot = self._attachment_snapshot_from_record(
+                        current,
+                        relative_path,
+                    )
+                note_snapshot = metadata_snapshot.get("note")
+                if note_snapshot is None and current:
+                    note_snapshot = current.get("noteSnapshot")
+            else:
+                note_snapshot = metadata_snapshot.get("note")
+                if note_snapshot is None and current:
+                    note_snapshot = current.get("deletedNote") or current.get(
+                        "noteSnapshot"
+                    )
+                if note_snapshot is None:
+                    note_snapshot = self._note_snapshot_from_metadata(relative_path)
             target_hash = sha256_bytes(content) if content is not None else None
 
             now = utc_now()
             updated_at_ms = utc_now_ms()
             if content is None:
                 if current_deleted:
-                    metadata_result = self._sync_rollback_metadata(
-                        state,
-                        relative_path,
-                        deleted=True,
-                        now=now,
-                        updated_at_ms=updated_at_ms,
-                    )
+                    if is_attachment:
+                        metadata_result = self._sync_rollback_attachment_metadata(
+                            state,
+                            relative_path,
+                            deleted=True,
+                            now=now,
+                            updated_at_ms=updated_at_ms,
+                            attachment_snapshot=attachment_snapshot,
+                            note_snapshot=note_snapshot,
+                        )
+                    else:
+                        metadata_result = self._sync_rollback_metadata(
+                            state,
+                            relative_path,
+                            deleted=True,
+                            now=now,
+                            updated_at_ms=updated_at_ms,
+                        )
                     if metadata_result["status"] != "unchanged":
                         state["updatedAt"] = now
                         atomic_write_json(self.state_path, state)
@@ -224,7 +253,24 @@ class SyncStore:
                     file_path.unlink()
             else:
                 if not current_deleted and current_hash == target_hash:
-                    if metadata_note_snapshot is None:
+                    restored_attachments = []
+                    if is_attachment:
+                        metadata_result = self._sync_rollback_attachment_metadata(
+                            state,
+                            relative_path,
+                            deleted=False,
+                            now=now,
+                            updated_at_ms=updated_at_ms,
+                            attachment_snapshot=attachment_snapshot,
+                            note_snapshot=note_snapshot,
+                        )
+                    else:
+                        restored_attachments = self._restore_note_snapshot_attachments(
+                            state,
+                            relative_path,
+                            note_snapshot,
+                            now,
+                        )
                         metadata_result = self._sync_rollback_metadata(
                             state,
                             relative_path,
@@ -234,23 +280,27 @@ class SyncStore:
                             note_snapshot=note_snapshot,
                             restored_content=content,
                         )
-                        if metadata_result["status"] != "unchanged":
-                            state["updatedAt"] = now
-                            atomic_write_json(self.state_path, state)
-                            return {
-                                "status": "accepted",
-                                "relativePath": relative_path,
-                                "revision": current_revision,
-                                "serverRevision": state["serverRevision"],
-                                "contentHash": target_hash,
-                                "deleted": False,
-                                "gitCommit": (
-                                    current.get("gitCommit") if current else None
-                                ),
-                                "rolledBackToCommit": commit,
-                                "metadata": metadata_result,
-                                "manifest": self._manifest_from_state(state),
-                            }
+                    if (
+                        metadata_result["status"] != "unchanged"
+                        or restored_attachments
+                    ):
+                        state["updatedAt"] = now
+                        atomic_write_json(self.state_path, state)
+                        return {
+                            "status": "accepted",
+                            "relativePath": relative_path,
+                            "revision": current_revision,
+                            "serverRevision": state["serverRevision"],
+                            "contentHash": target_hash,
+                            "deleted": False,
+                            "gitCommit": (
+                                current.get("gitCommit") if current else None
+                            ),
+                            "rolledBackToCommit": commit,
+                            "metadata": metadata_result,
+                            "restoredAttachments": restored_attachments,
+                            "manifest": self._manifest_from_state(state),
+                        }
                     return {
                         "status": "unchanged",
                         "relativePath": relative_path,
@@ -265,8 +315,9 @@ class SyncStore:
             file_revision = state["serverRevision"]
             message = f"Rollback {relative_path} to {commit[:12]}"
             git_commit = self._commit_file_change(relative_path, message)
+            history_fields = self._record_history_fields(current)
             if content is None:
-                state["files"][relative_path] = {
+                next_record = {
                     "revision": file_revision,
                     "contentHash": current_hash,
                     "size": current.get("size", 0) if current else 0,
@@ -276,10 +327,21 @@ class SyncStore:
                     "gitCommit": git_commit,
                     "rolledBackToGitCommit": commit,
                 }
-                if note_snapshot:
-                    state["files"][relative_path]["deletedNote"] = note_snapshot
+                next_record.update(history_fields)
+                if is_attachment:
+                    next_record.update(
+                        self._attachment_rollback_record_metadata(
+                            attachment_snapshot,
+                            current,
+                            relative_path,
+                            deleted=True,
+                        )
+                    )
+                elif note_snapshot:
+                    next_record["deletedNote"] = note_snapshot
+                state["files"][relative_path] = next_record
             else:
-                state["files"][relative_path] = {
+                next_record = {
                     "revision": file_revision,
                     "contentHash": target_hash,
                     "size": len(content),
@@ -289,16 +351,49 @@ class SyncStore:
                     "gitCommit": git_commit,
                     "rolledBackToGitCommit": commit,
                 }
+                next_record.update(history_fields)
+                if is_attachment:
+                    next_record.update(
+                        self._attachment_rollback_record_metadata(
+                            attachment_snapshot,
+                            current,
+                            relative_path,
+                            deleted=False,
+                            content_hash=target_hash,
+                            size=len(content),
+                            updated_at_ms=updated_at_ms,
+                        )
+                    )
+                state["files"][relative_path] = next_record
 
-            metadata_result = self._sync_rollback_metadata(
-                state,
-                relative_path,
-                deleted=content is None,
-                now=now,
-                updated_at_ms=updated_at_ms,
-                note_snapshot=note_snapshot,
-                restored_content=content,
-            )
+            restored_attachments = []
+            if is_attachment:
+                metadata_result = self._sync_rollback_attachment_metadata(
+                    state,
+                    relative_path,
+                    deleted=content is None,
+                    now=now,
+                    updated_at_ms=updated_at_ms,
+                    attachment_snapshot=attachment_snapshot,
+                    note_snapshot=note_snapshot,
+                )
+            else:
+                if content is not None:
+                    restored_attachments = self._restore_note_snapshot_attachments(
+                        state,
+                        relative_path,
+                        note_snapshot,
+                        now,
+                    )
+                metadata_result = self._sync_rollback_metadata(
+                    state,
+                    relative_path,
+                    deleted=content is None,
+                    now=now,
+                    updated_at_ms=updated_at_ms,
+                    note_snapshot=note_snapshot,
+                    restored_content=content,
+                )
             state["updatedAt"] = now
             atomic_write_json(self.state_path, state)
             return {
@@ -311,6 +406,7 @@ class SyncStore:
                 "gitCommit": git_commit,
                 "rolledBackToCommit": commit,
                 "metadata": metadata_result,
+                "restoredAttachments": restored_attachments,
                 "manifest": self._manifest_from_state(state),
             }
 
@@ -521,7 +617,7 @@ class SyncStore:
                     item.get("lastKnownRevision"),
                     f"{relative_path}.lastKnownRevision",
                 )
-                if current and current.get("revision", 0) <= last_known_revision:
+                if current and current.get("revision", 0) == last_known_revision:
                     metadata_deleted_file_paths.add(relative_path)
             if "metadata" in payload:
                 metadata_result = self._sync_metadata(
@@ -809,6 +905,20 @@ class SyncStore:
                 "serverFile": self._file_change(relative_path, current),
             }
 
+        if (
+            deleted
+            and current
+            and not current.get("deleted")
+            and current_revision != last_known_revision
+        ):
+            return {
+                "status": "conflict",
+                "relativePath": relative_path,
+                "clientRevision": last_known_revision,
+                "serverRevision": current_revision,
+                "serverFile": self._file_change(relative_path, current),
+            }
+
         if deleted:
             if not current or current.get("deleted"):
                 return {
@@ -835,6 +945,7 @@ class SyncStore:
                 "clientUpdatedAtMs": item.get("updatedAtMs"),
                 "gitCommit": git_commit,
             }
+            next_record.update(self._record_history_fields(current))
             if kind == "attachment":
                 next_record.update(
                     self._attachment_record_metadata(
@@ -887,6 +998,7 @@ class SyncStore:
             "clientUpdatedAtMs": item.get("updatedAtMs"),
             "gitCommit": git_commit,
         }
+        next_record.update(self._record_history_fields(current))
         if kind == "attachment":
             next_record.update(
                 self._attachment_record_metadata(
@@ -988,6 +1100,302 @@ class SyncStore:
         }
         return {key: value for key, value in result.items() if value is not None}
 
+    def _record_history_fields(self, record):
+        if not isinstance(record, dict):
+            return {}
+        snapshots = record.get("metadataSnapshots")
+        if not isinstance(snapshots, dict):
+            return {}
+        return {"metadataSnapshots": copy.deepcopy(snapshots)}
+
+    def _metadata_snapshot_for_commit(self, record, commit):
+        if not isinstance(record, dict):
+            return {}
+
+        snapshots = record.get("metadataSnapshots")
+        if isinstance(snapshots, dict):
+            snapshot = snapshots.get(commit)
+            if isinstance(snapshot, dict):
+                return copy.deepcopy(snapshot)
+
+        if record.get("gitCommit") == commit:
+            snapshot = {}
+            if isinstance(record.get("noteSnapshot"), dict):
+                snapshot["note"] = copy.deepcopy(record["noteSnapshot"])
+            if isinstance(record.get("attachmentSnapshot"), dict):
+                snapshot["attachment"] = copy.deepcopy(record["attachmentSnapshot"])
+            return snapshot
+
+        return {}
+
+    def _store_metadata_snapshot(
+        self,
+        record,
+        git_commit,
+        note_snapshot=None,
+        attachment_snapshot=None,
+    ):
+        if not isinstance(record, dict) or not git_commit:
+            return False
+
+        snapshot = {}
+        snapshots = record.setdefault("metadataSnapshots", {})
+        if isinstance(snapshots.get(git_commit), dict):
+            snapshot.update(copy.deepcopy(snapshots[git_commit]))
+
+        if isinstance(note_snapshot, dict):
+            note_copy = copy.deepcopy(note_snapshot)
+            record["noteSnapshot"] = note_copy
+            snapshot.setdefault("note", note_copy)
+
+        if isinstance(attachment_snapshot, dict):
+            attachment_copy = copy.deepcopy(attachment_snapshot)
+            record["attachmentSnapshot"] = attachment_copy
+            snapshot.setdefault("attachment", attachment_copy)
+
+        if not snapshot:
+            return False
+
+        snapshots[git_commit] = snapshot
+        return True
+
+    def _store_note_metadata_snapshot(self, state, relative_path, metadata):
+        record = state["files"].get(relative_path)
+        if not isinstance(record, dict) or self._is_attachment_record(record):
+            return False
+
+        note = self._notes_by_path(metadata).get(relative_path)
+        if not isinstance(note, dict):
+            return False
+
+        return self._store_metadata_snapshot(
+            record,
+            record.get("gitCommit"),
+            note_snapshot=note,
+        )
+
+    def _store_attachment_metadata_snapshot(
+        self,
+        state,
+        relative_path,
+        note_relative_path,
+        metadata,
+    ):
+        record = state["files"].get(relative_path)
+        if not isinstance(record, dict) or not self._is_attachment_record(record):
+            return False
+
+        note = self._notes_by_path(metadata).get(note_relative_path)
+        attachment_entry = self._attachments_by_path(metadata).get(relative_path)
+        attachment = (
+            attachment_entry.get("attachment") if attachment_entry else None
+        ) or self._attachment_snapshot_from_record(record, relative_path)
+
+        return self._store_metadata_snapshot(
+            record,
+            record.get("gitCommit"),
+            note_snapshot=note,
+            attachment_snapshot=attachment,
+        )
+
+    def _normalized_attachment_snapshot(
+        self,
+        attachment,
+        relative_path,
+        note_relative_path=None,
+        content_hash=None,
+        size=None,
+        updated_at_ms=None,
+    ):
+        snapshot = dict(attachment) if isinstance(attachment, dict) else {}
+        relative_path = normalize_relative_path(relative_path)
+        snapshot["relativePath"] = relative_path
+
+        if note_relative_path:
+            snapshot["noteRelativePath"] = normalize_relative_path(note_relative_path)
+        elif snapshot.get("noteRelativePath"):
+            snapshot["noteRelativePath"] = normalize_relative_path(
+                snapshot.get("noteRelativePath")
+            )
+
+        if content_hash is not None:
+            snapshot["contentHash"] = content_hash
+        if size is not None:
+            snapshot["size"] = size
+        if updated_at_ms is not None:
+            snapshot["updatedAtMs"] = updated_at_ms
+        snapshot["deleted"] = False
+        return {key: value for key, value in snapshot.items() if value is not None}
+
+    def _attachment_snapshot_from_record(
+        self,
+        record,
+        relative_path,
+        content_hash=None,
+        size=None,
+        updated_at_ms=None,
+    ):
+        record = record or {}
+        snapshot = {
+            "id": record.get("attachmentId"),
+            "fileName": record.get("fileName") or PurePosixPath(relative_path).name,
+            "relativePath": relative_path,
+            "mimeType": record.get("mimeType"),
+            "contentHash": (
+                content_hash if content_hash is not None else record.get("contentHash")
+            ),
+            "size": size if size is not None else record.get("size", 0),
+            "updatedAtMs": (
+                updated_at_ms
+                if updated_at_ms is not None
+                else record.get("clientUpdatedAtMs")
+            ),
+            "noteRelativePath": record.get("noteRelativePath"),
+            "noteId": record.get("noteId"),
+        }
+        return {key: value for key, value in snapshot.items() if value is not None}
+
+    def _attachment_rollback_record_metadata(
+        self,
+        attachment_snapshot,
+        current,
+        relative_path,
+        deleted,
+        content_hash=None,
+        size=None,
+        updated_at_ms=None,
+    ):
+        current = current or {}
+        attachment = self._normalized_attachment_snapshot(
+            attachment_snapshot,
+            relative_path,
+            note_relative_path=(
+                (attachment_snapshot or {}).get("noteRelativePath")
+                if isinstance(attachment_snapshot, dict)
+                else None
+            )
+            or current.get("noteRelativePath"),
+            content_hash=content_hash,
+            size=size,
+            updated_at_ms=updated_at_ms,
+        )
+        note_relative_path = attachment.get("noteRelativePath")
+        if not note_relative_path and not deleted:
+            raise SyncError("noteRelativePath is required for attachment rollback.")
+
+        return {
+            key: value
+            for key, value in {
+                "kind": "attachment",
+                "noteRelativePath": note_relative_path,
+                "noteId": attachment.get("noteId") or current.get("noteId"),
+                "attachmentId": attachment.get("id")
+                or attachment.get("attachmentId")
+                or current.get("attachmentId"),
+                "fileName": attachment.get("fileName")
+                or current.get("fileName")
+                or PurePosixPath(relative_path).name,
+                "mimeType": attachment.get("mimeType") or current.get("mimeType"),
+            }.items()
+            if value is not None
+        }
+
+    def _attachment_content_from_history(self, relative_path, content_hash=None):
+        for item in self._git_history(relative_path):
+            if item.get("deleted"):
+                continue
+            if content_hash and item.get("contentHash") != content_hash:
+                continue
+            content = self._git_file_content(relative_path, item["commit"])
+            if content is not None:
+                return content, item["commit"]
+        return None, None
+
+    def _restore_note_snapshot_attachments(
+        self,
+        state,
+        note_relative_path,
+        note_snapshot,
+        now,
+    ):
+        if not isinstance(note_snapshot, dict):
+            return []
+
+        attachments = note_snapshot.get("attachments", [])
+        if not isinstance(attachments, list):
+            return []
+
+        restored = []
+        for attachment in attachments:
+            if not isinstance(attachment, dict):
+                continue
+            relative_path = attachment.get("relativePath")
+            if not relative_path:
+                continue
+            relative_path = normalize_relative_path(relative_path)
+            target_hash = self._attachment_metadata_hash(attachment)
+            current = state["files"].get(relative_path)
+            if (
+                current
+                and self._is_attachment_record(current)
+                and not current.get("deleted")
+                and (not target_hash or current.get("contentHash") == target_hash)
+            ):
+                continue
+
+            content, source_commit = self._attachment_content_from_history(
+                relative_path,
+                target_hash,
+            )
+            if content is None:
+                continue
+
+            atomic_write_bytes(self._file_path(relative_path), content)
+            state["serverRevision"] += 1
+            git_commit = self._commit_file_change(
+                relative_path,
+                f"Restore attachment {relative_path} for rollback",
+            )
+            attachment_snapshot = self._normalized_attachment_snapshot(
+                attachment,
+                relative_path,
+                note_relative_path=note_relative_path,
+                content_hash=sha256_bytes(content),
+                size=len(content),
+            )
+            next_record = {
+                "revision": state["serverRevision"],
+                "contentHash": sha256_bytes(content),
+                "size": len(content),
+                "deleted": False,
+                "serverUpdatedAt": now,
+                "clientUpdatedAtMs": attachment_snapshot.get("updatedAtMs"),
+                "gitCommit": git_commit,
+                "restoredFromGitCommit": source_commit,
+            }
+            next_record.update(self._record_history_fields(current))
+            next_record.update(
+                self._attachment_rollback_record_metadata(
+                    attachment_snapshot,
+                    current,
+                    relative_path,
+                    deleted=False,
+                    content_hash=sha256_bytes(content),
+                    size=len(content),
+                    updated_at_ms=attachment_snapshot.get("updatedAtMs"),
+                )
+            )
+            state["files"][relative_path] = next_record
+            self._store_metadata_snapshot(
+                next_record,
+                git_commit,
+                note_snapshot=note_snapshot,
+                attachment_snapshot=attachment_snapshot,
+            )
+            restored.append(self._file_record(relative_path, next_record))
+
+        return restored
+
     def _sync_file_metadata(self, state, payload, now):
         relative_path = normalize_relative_path(payload.get("relativePath"))
         deleted = self._to_bool(payload.get("deleted"), f"{relative_path}.deleted")
@@ -1034,6 +1442,8 @@ class SyncStore:
                 changed = self._upsert_note(metadata, normalized_note) or changed
 
         if not changed:
+            if not deleted:
+                self._store_note_metadata_snapshot(state, relative_path, metadata)
             return {
                 "status": "unchanged",
                 "revision": state["metadata"].get("revision", 0),
@@ -1049,6 +1459,8 @@ class SyncStore:
             "contentHash": content_hash,
             "updatedAt": now,
         }
+        if not deleted:
+            self._store_note_metadata_snapshot(state, relative_path, metadata)
         return {
             "status": "accepted",
             "revision": state["serverRevision"],
@@ -1137,6 +1549,13 @@ class SyncStore:
             )
 
         if not changed:
+            self._store_attachment_metadata_snapshot(
+                state,
+                relative_path,
+                note_relative_path,
+                metadata,
+            )
+            self._store_note_metadata_snapshot(state, note_relative_path, metadata)
             return {
                 "status": "unchanged",
                 "revision": state["metadata"].get("revision", 0),
@@ -1152,6 +1571,13 @@ class SyncStore:
             "contentHash": content_hash,
             "updatedAt": now,
         }
+        self._store_attachment_metadata_snapshot(
+            state,
+            relative_path,
+            note_relative_path,
+            metadata,
+        )
+        self._store_note_metadata_snapshot(state, note_relative_path, metadata)
         return {
             "status": "accepted",
             "revision": state["serverRevision"],
@@ -1179,6 +1605,7 @@ class SyncStore:
                 note_snapshot=note_snapshot,
                 restored_content=restored_content,
             )
+            self._store_note_metadata_snapshot(state, relative_path, metadata)
 
         if not changed:
             return {
@@ -1202,6 +1629,112 @@ class SyncStore:
             "contentHash": content_hash,
         }
 
+    def _sync_rollback_attachment_metadata(
+        self,
+        state,
+        relative_path,
+        deleted,
+        now,
+        updated_at_ms,
+        attachment_snapshot=None,
+        note_snapshot=None,
+    ):
+        record = state["files"].get(relative_path) or {}
+        attachment = self._normalized_attachment_snapshot(
+            attachment_snapshot,
+            relative_path,
+            note_relative_path=(
+                (attachment_snapshot or {}).get("noteRelativePath")
+                if isinstance(attachment_snapshot, dict)
+                else None
+            )
+            or record.get("noteRelativePath"),
+            content_hash=record.get("contentHash"),
+            size=record.get("size"),
+            updated_at_ms=updated_at_ms,
+        )
+        note_relative_path = attachment.get("noteRelativePath") or record.get(
+            "noteRelativePath"
+        )
+        if not note_relative_path:
+            return {
+                "status": "unchanged",
+                "revision": state["metadata"].get("revision", 0),
+                "contentHash": state["metadata"].get("contentHash"),
+            }
+        note_relative_path = normalize_relative_path(note_relative_path)
+
+        metadata = self._read_metadata_body() or self._empty_metadata()
+        changed = False
+        current_note = self._note_for_update(
+            metadata,
+            note_relative_path,
+            create=False,
+        )
+        if current_note is None and isinstance(note_snapshot, dict):
+            restored_note = self._note_from_snapshot_or_content(
+                note_relative_path,
+                updated_at_ms,
+                note_snapshot=note_snapshot,
+            )
+            changed = self._upsert_note(metadata, restored_note) or changed
+        else:
+            changed = self._ensure_note(metadata, note_relative_path) or changed
+
+        if deleted:
+            changed = (
+                self._remove_note_attachment(metadata, note_relative_path, relative_path)
+                or changed
+            )
+        else:
+            changed = (
+                self._upsert_note_attachment(
+                    metadata,
+                    note_relative_path,
+                    attachment,
+                )
+                or changed
+            )
+
+        self._store_note_metadata_snapshot(state, note_relative_path, metadata)
+        if not deleted:
+            self._store_attachment_metadata_snapshot(
+                state,
+                relative_path,
+                note_relative_path,
+                metadata,
+            )
+
+        if not changed:
+            return {
+                "status": "unchanged",
+                "revision": state["metadata"].get("revision", 0),
+                "contentHash": state["metadata"].get("contentHash"),
+            }
+
+        metadata["generatedAt"] = now
+        content_hash = sha256_json(metadata)
+        state["serverRevision"] += 1
+        atomic_write_json(self.metadata_path, metadata)
+        state["metadata"] = {
+            "revision": state["serverRevision"],
+            "contentHash": content_hash,
+            "updatedAt": now,
+        }
+        self._store_note_metadata_snapshot(state, note_relative_path, metadata)
+        if not deleted:
+            self._store_attachment_metadata_snapshot(
+                state,
+                relative_path,
+                note_relative_path,
+                metadata,
+            )
+        return {
+            "status": "accepted",
+            "revision": state["serverRevision"],
+            "contentHash": content_hash,
+        }
+
     def _restore_note_metadata(
         self,
         metadata,
@@ -1211,7 +1744,9 @@ class SyncStore:
         restored_content=None,
     ):
         notes = metadata.setdefault("notes", [])
-        for note in notes:
+        existing_index = None
+        existing_note = None
+        for index, note in enumerate(notes):
             if not isinstance(note, dict):
                 continue
             try:
@@ -1220,17 +1755,33 @@ class SyncStore:
                 continue
             if note_path != relative_path:
                 continue
-            if note.get("updatedAtMs") == updated_at_ms:
-                return False
-            note["updatedAtMs"] = updated_at_ms
-            return True
+            existing_index = index
+            existing_note = note
+            break
 
-        restored_note = self._note_from_snapshot_or_content(
-            relative_path,
-            updated_at_ms,
-            note_snapshot=note_snapshot,
-            content=restored_content,
-        )
+        if isinstance(note_snapshot, dict):
+            restored_note = self._note_from_snapshot_or_content(
+                relative_path,
+                updated_at_ms,
+                note_snapshot=note_snapshot,
+                content=restored_content,
+            )
+        elif existing_note is not None:
+            restored_note = dict(existing_note)
+            restored_note["relativePath"] = relative_path
+            restored_note.setdefault("fileName", PurePosixPath(relative_path).name)
+            restored_note["updatedAtMs"] = updated_at_ms
+            if not restored_note.get("title"):
+                title = self._markdown_title(restored_content)
+                if title:
+                    restored_note["title"] = title
+        else:
+            restored_note = self._note_from_snapshot_or_content(
+                relative_path,
+                updated_at_ms,
+                content=restored_content,
+            )
+
         workspace_id = restored_note.get("workspace")
         if workspace_id and workspace_id not in self._workspaces_by_id(metadata):
             self._upsert_workspace(
@@ -1240,7 +1791,15 @@ class SyncStore:
                     "name": restored_note.get("workspaceName") or workspace_id,
                 },
             )
-        return self._upsert_note(metadata, restored_note)
+
+        if existing_index is not None:
+            if existing_note == restored_note:
+                return False
+            notes[existing_index] = restored_note
+            return True
+
+        notes.append(restored_note)
+        return True
 
     def _note_from_snapshot_or_content(
         self,
@@ -1413,7 +1972,7 @@ class SyncStore:
                             )
                         )
                 elif record:
-                    if client_delete_requested and server_revision <= last_known_revision:
+                    if client_delete_requested and server_revision == last_known_revision:
                         plan["deleteServerFiles"].append(
                             self._delete_plan_item(
                                 relative_path,
@@ -1494,7 +2053,7 @@ class SyncStore:
                         )
                     continue
 
-                if client_delete_requested and server_revision <= last_known_revision:
+                if client_delete_requested and server_revision == last_known_revision:
                     plan["deleteServerFiles"].append(
                         self._delete_plan_item(
                             relative_path,
@@ -1690,7 +2249,7 @@ class SyncStore:
                         )
                     )
                 elif record and not server_deleted:
-                    if client_delete_requested and server_revision <= last_known_revision:
+                    if client_delete_requested and server_revision == last_known_revision:
                         plan["deleteServerAttachments"].append(
                             self._attachment_delete_plan_item(
                                 relative_path,
@@ -1780,7 +2339,7 @@ class SyncStore:
                         )
                     continue
 
-                if client_delete_requested and server_revision <= last_known_revision:
+                if client_delete_requested and server_revision == last_known_revision:
                     plan["deleteServerAttachments"].append(
                         self._attachment_delete_plan_item(
                             relative_path,

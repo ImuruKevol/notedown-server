@@ -945,6 +945,15 @@ def build_openapi_spec(server_url):
                         "gitCommit": {"type": ["string", "null"]},
                         "rolledBackToCommit": {"type": "string"},
                         "metadata": {"$ref": "#/components/schemas/MetadataSyncResult"},
+                        "restoredAttachments": {
+                            "type": "array",
+                            "description": (
+                                "Attachment records restored from Git history while "
+                                "rolling back a note snapshot."
+                            ),
+                            "items": {"$ref": "#/components/schemas/FileRecord"},
+                            "default": [],
+                        },
                         "manifest": {"$ref": "#/components/schemas/Manifest"},
                     },
                     "additionalProperties": True,

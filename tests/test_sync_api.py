@@ -841,6 +841,195 @@ class SyncApiTest(unittest.TestCase):
         self.assertEqual(settled_plan["uploadAttachments"], [])
         self.assertEqual(settled_plan["downloadAttachments"], [])
 
+    def test_save_time_cross_device_file_and_attachment_sync(self):
+        note_content_a = "# A 기기 저장\n\n초기 내용\n"
+        image_content = b"\x89PNG\r\ncross-device-image"
+        image_digest = hashlib.sha256(image_content).hexdigest()
+        metadata_a = self.note_metadata(updated_at_ms=100)
+        image_attachment = self.attachment_metadata(image_content)
+        metadata_a["notes"][0]["title"] = "A 기기 저장"
+        metadata_a["notes"][0]["attachments"] = [image_attachment]
+
+        a_file_upload = self.client.post(
+            "/api/sync/file",
+            headers=self.headers,
+            json={
+                "clientId": "device-a",
+                "baseRevision": 0,
+                "relativePath": "memo/note.md",
+                "lastKnownRevision": 0,
+                "updatedAtMs": 100,
+                "contentEncoding": "utf-8",
+                "content": note_content_a,
+                "workspace": {"id": "memo", "name": "memo"},
+                "note": metadata_a["notes"][0],
+            },
+        ).get_json()
+
+        a_attachment_upload = self.client.post(
+            "/api/sync/attachment",
+            headers=self.headers,
+            json={
+                "clientId": "device-a",
+                "baseRevision": a_file_upload["serverRevision"],
+                "noteRelativePath": "memo/note.md",
+                "relativePath": image_attachment["relativePath"],
+                "lastKnownRevision": 0,
+                "updatedAtMs": image_attachment["updatedAtMs"],
+                "contentEncoding": "base64",
+                "content": base64.b64encode(image_content).decode("ascii"),
+                "contentHash": image_digest,
+                "note": metadata_a["notes"][0],
+                "attachment": image_attachment,
+            },
+        ).get_json()
+
+        b_initial_plan = self.client.post(
+            "/api/sync/plan",
+            headers=self.headers,
+            json={
+                "clientId": "device-b",
+                "baseRevision": 0,
+                "metadata": {
+                    "lastKnownRevision": 0,
+                    "body": {"version": 1, "workspaces": [], "notes": []},
+                },
+                "knownFiles": [],
+                "knownAttachments": [],
+            },
+        ).get_json()["plan"]
+
+        self.assertEqual(
+            b_initial_plan["downloadFiles"][0]["relativePath"],
+            "memo/note.md",
+        )
+        self.assertEqual(
+            b_initial_plan["downloadAttachments"][0]["relativePath"],
+            image_attachment["relativePath"],
+        )
+        self.assertEqual(b_initial_plan["deleteServerFiles"], [])
+        self.assertEqual(b_initial_plan["deleteServerAttachments"], [])
+
+        b_file_download = self.client.get(
+            "/api/files/memo/note.md",
+            headers=self.headers,
+        ).get_json()
+        b_attachment_download = self.client.get(
+            f"/api/attachments/{image_attachment['relativePath']}",
+            headers=self.headers,
+        ).get_json()
+        self.assertEqual(self.decoded_content(b_file_download), note_content_a)
+        self.assertEqual(base64.b64decode(b_attachment_download["content"]), image_content)
+
+        note_content_b = "# B 기기 저장\n\n수정 내용\n"
+        extra_content = b"extra attachment from device b\n"
+        extra_digest = hashlib.sha256(extra_content).hexdigest()
+        extra_attachment = {
+            "id": "att-2",
+            "fileName": "device-b.txt",
+            "relativePath": "memo/.attachments/note-1/device-b.txt",
+            "mimeType": "text/plain",
+            "size": len(extra_content),
+            "contentHash": extra_digest,
+            "updatedAtMs": 210,
+        }
+        metadata_b = self.note_metadata(updated_at_ms=200)
+        metadata_b["notes"][0]["title"] = "B 기기 저장"
+        metadata_b["notes"][0]["attachments"] = [
+            image_attachment,
+            extra_attachment,
+        ]
+
+        b_file_upload = self.client.post(
+            "/api/sync/file",
+            headers=self.headers,
+            json={
+                "clientId": "device-b",
+                "baseRevision": a_attachment_upload["serverRevision"],
+                "relativePath": "memo/note.md",
+                "lastKnownRevision": a_file_upload["file"]["revision"],
+                "updatedAtMs": 200,
+                "contentEncoding": "utf-8",
+                "content": note_content_b,
+                "workspace": {"id": "memo", "name": "memo"},
+                "note": metadata_b["notes"][0],
+            },
+        ).get_json()
+
+        b_attachment_upload = self.client.post(
+            "/api/sync/attachment",
+            headers=self.headers,
+            json={
+                "clientId": "device-b",
+                "baseRevision": b_file_upload["serverRevision"],
+                "noteRelativePath": "memo/note.md",
+                "relativePath": extra_attachment["relativePath"],
+                "lastKnownRevision": 0,
+                "updatedAtMs": extra_attachment["updatedAtMs"],
+                "contentEncoding": "base64",
+                "content": base64.b64encode(extra_content).decode("ascii"),
+                "contentHash": extra_digest,
+                "note": metadata_b["notes"][0],
+                "attachment": extra_attachment,
+            },
+        ).get_json()
+
+        self.assertEqual(b_file_upload["file"]["status"], "accepted")
+        self.assertEqual(b_attachment_upload["attachment"]["status"], "accepted")
+
+        a_followup_plan = self.client.post(
+            "/api/sync/plan",
+            headers=self.headers,
+            json={
+                "clientId": "device-a",
+                "baseRevision": a_attachment_upload["serverRevision"],
+                "metadata": {
+                    "lastKnownRevision": (
+                        a_attachment_upload["manifest"]["metadata"]["revision"]
+                    ),
+                    "body": metadata_a,
+                },
+                "knownFiles": [
+                    {
+                        "relativePath": "memo/note.md",
+                        "lastKnownRevision": a_file_upload["file"]["revision"],
+                        "contentHash": a_file_upload["file"]["contentHash"],
+                    }
+                ],
+                "knownAttachments": [
+                    {
+                        "relativePath": image_attachment["relativePath"],
+                        "lastKnownRevision": (
+                            a_attachment_upload["attachment"]["revision"]
+                        ),
+                        "contentHash": image_digest,
+                    }
+                ],
+            },
+        ).get_json()["plan"]
+
+        self.assertEqual(a_followup_plan["deleteServerFiles"], [])
+        self.assertEqual(a_followup_plan["deleteServerAttachments"], [])
+        self.assertEqual(
+            a_followup_plan["downloadFiles"][0]["relativePath"],
+            "memo/note.md",
+        )
+        self.assertEqual(
+            a_followup_plan["downloadAttachments"][0]["relativePath"],
+            extra_attachment["relativePath"],
+        )
+
+        a_file_after_b_save = self.client.get(
+            "/api/files/memo/note.md",
+            headers=self.headers,
+        ).get_json()
+        a_extra_attachment = self.client.get(
+            f"/api/attachments/{extra_attachment['relativePath']}",
+            headers=self.headers,
+        ).get_json()
+        self.assertEqual(self.decoded_content(a_file_after_b_save), note_content_b)
+        self.assertEqual(base64.b64decode(a_extra_attachment["content"]), extra_content)
+
     def test_file_upload_creates_git_history(self):
         first = self.client.post(
             "/api/sync/file",
@@ -1083,6 +1272,311 @@ class SyncApiTest(unittest.TestCase):
         self.assertFalse(restored_file["deleted"])
         self.assertEqual(restored_file["note"]["title"], "복구할 노트")
         self.assertEqual(restored_file["note"]["workspaceName"], "memo")
+
+    def test_rollback_note_restores_deleted_attachment_content_and_metadata(self):
+        image_content = b"\x89PNG\r\nrollback-image"
+        image_digest = hashlib.sha256(image_content).hexdigest()
+        metadata = self.note_metadata(updated_at_ms=100)
+        attachment = self.attachment_metadata(image_content)
+        metadata["notes"][0]["attachments"] = [attachment]
+
+        note_upload = self.client.post(
+            "/api/sync/file",
+            headers=self.headers,
+            json={
+                "clientId": "client-a",
+                "baseRevision": 0,
+                "relativePath": "memo/note.md",
+                "lastKnownRevision": 0,
+                "updatedAtMs": 100,
+                "contentEncoding": "utf-8",
+                "content": "# 첨부가 있는 노트\n",
+                "workspace": {"id": "memo", "name": "memo"},
+                "note": metadata["notes"][0],
+            },
+        ).get_json()
+
+        attachment_upload = self.client.post(
+            "/api/sync/attachment",
+            headers=self.headers,
+            json={
+                "clientId": "client-a",
+                "baseRevision": note_upload["serverRevision"],
+                "noteRelativePath": "memo/note.md",
+                "relativePath": attachment["relativePath"],
+                "lastKnownRevision": 0,
+                "updatedAtMs": attachment["updatedAtMs"],
+                "contentEncoding": "base64",
+                "content": base64.b64encode(image_content).decode("ascii"),
+                "contentHash": image_digest,
+                "note": metadata["notes"][0],
+                "attachment": attachment,
+            },
+        ).get_json()
+
+        deleted_attachment = self.client.post(
+            "/api/sync/attachment",
+            headers=self.headers,
+            json={
+                "clientId": "client-a",
+                "baseRevision": attachment_upload["serverRevision"],
+                "noteRelativePath": "memo/note.md",
+                "relativePath": attachment["relativePath"],
+                "lastKnownRevision": attachment_upload["attachment"]["revision"],
+                "deleted": True,
+                "updatedAtMs": 120,
+            },
+        ).get_json()
+        self.assertEqual(deleted_attachment["attachment"]["status"], "accepted")
+
+        metadata_without_attachment = self.note_metadata(updated_at_ms=130)
+        metadata_without_attachment["notes"][0]["attachments"] = []
+        second_note = self.client.post(
+            "/api/sync/file",
+            headers=self.headers,
+            json={
+                "clientId": "client-a",
+                "baseRevision": deleted_attachment["serverRevision"],
+                "relativePath": "memo/note.md",
+                "lastKnownRevision": note_upload["file"]["revision"],
+                "updatedAtMs": 130,
+                "contentEncoding": "utf-8",
+                "content": "# 첨부가 제거된 노트\n",
+                "workspace": {"id": "memo", "name": "memo"},
+                "note": metadata_without_attachment["notes"][0],
+            },
+        ).get_json()
+
+        commits = self.client.get(
+            "/api/admin/files/memo/note.md/history",
+            headers=self.headers,
+        ).get_json()["commits"]
+        original_note_commit = commits[-1]["commit"]
+
+        rollback = self.client.post(
+            "/api/admin/files/memo/note.md/rollback",
+            headers=self.headers,
+            json={"commit": original_note_commit},
+        ).get_json()
+
+        self.assertEqual(rollback["status"], "accepted")
+        self.assertEqual(rollback["metadata"]["status"], "accepted")
+        self.assertEqual(
+            rollback["restoredAttachments"][0]["relativePath"],
+            attachment["relativePath"],
+        )
+
+        restored_attachment = self.client.get(
+            f"/api/attachments/{attachment['relativePath']}",
+            headers=self.headers,
+        )
+        self.assertEqual(restored_attachment.status_code, 200)
+        restored_payload = restored_attachment.get_json()
+        self.assertEqual(base64.b64decode(restored_payload["content"]), image_content)
+        self.assertEqual(restored_payload["contentHash"], image_digest)
+        self.assertEqual(restored_payload["kind"], "attachment")
+
+        plan = self.client.post(
+            "/api/sync/plan",
+            headers=self.headers,
+            json={
+                "clientId": "client-a",
+                "baseRevision": second_note["serverRevision"],
+                "metadata": {
+                    "lastKnownRevision": second_note["manifest"]["metadata"]["revision"],
+                    "body": metadata_without_attachment,
+                },
+                "knownFiles": [
+                    {
+                        "relativePath": "memo/note.md",
+                        "lastKnownRevision": second_note["file"]["revision"],
+                        "contentHash": second_note["file"]["contentHash"],
+                    }
+                ],
+            },
+        ).get_json()
+
+        server_note = plan["metadata"]["serverMetadata"]["notes"][0]
+        self.assertEqual(
+            server_note["attachments"][0]["relativePath"],
+            attachment["relativePath"],
+        )
+
+    def test_rollback_attachment_preserves_attachment_kind_and_metadata(self):
+        first_content = b"\x89PNG\r\nfirst-image"
+        second_content = b"\x89PNG\r\nsecond-image"
+        first_digest = hashlib.sha256(first_content).hexdigest()
+        second_digest = hashlib.sha256(second_content).hexdigest()
+        metadata = self.note_metadata(updated_at_ms=100)
+        first_attachment = self.attachment_metadata(first_content)
+        metadata["notes"][0]["attachments"] = [first_attachment]
+
+        note_upload = self.client.post(
+            "/api/sync/file",
+            headers=self.headers,
+            json={
+                "clientId": "client-a",
+                "baseRevision": 0,
+                "relativePath": "memo/note.md",
+                "lastKnownRevision": 0,
+                "updatedAtMs": 100,
+                "contentEncoding": "utf-8",
+                "content": "# 이미지 노트\n",
+                "workspace": {"id": "memo", "name": "memo"},
+                "note": metadata["notes"][0],
+            },
+        ).get_json()
+
+        first_upload = self.client.post(
+            "/api/sync/attachment",
+            headers=self.headers,
+            json={
+                "clientId": "client-a",
+                "baseRevision": note_upload["serverRevision"],
+                "noteRelativePath": "memo/note.md",
+                "relativePath": first_attachment["relativePath"],
+                "lastKnownRevision": 0,
+                "updatedAtMs": first_attachment["updatedAtMs"],
+                "contentEncoding": "base64",
+                "content": base64.b64encode(first_content).decode("ascii"),
+                "contentHash": first_digest,
+                "note": metadata["notes"][0],
+                "attachment": first_attachment,
+            },
+        ).get_json()
+
+        second_attachment = dict(first_attachment)
+        second_attachment["contentHash"] = second_digest
+        second_attachment["size"] = len(second_content)
+        second_attachment["updatedAtMs"] = 200
+        metadata["notes"][0]["attachments"] = [second_attachment]
+        second_upload = self.client.post(
+            "/api/sync/attachment",
+            headers=self.headers,
+            json={
+                "clientId": "client-a",
+                "baseRevision": first_upload["serverRevision"],
+                "noteRelativePath": "memo/note.md",
+                "relativePath": first_attachment["relativePath"],
+                "lastKnownRevision": first_upload["attachment"]["revision"],
+                "updatedAtMs": second_attachment["updatedAtMs"],
+                "contentEncoding": "base64",
+                "content": base64.b64encode(second_content).decode("ascii"),
+                "contentHash": second_digest,
+                "note": metadata["notes"][0],
+                "attachment": second_attachment,
+            },
+        ).get_json()
+        self.assertEqual(second_upload["attachment"]["contentHash"], second_digest)
+
+        commits = self.client.get(
+            f"/api/admin/files/{first_attachment['relativePath']}/history",
+            headers=self.headers,
+        ).get_json()["commits"]
+        original_attachment_commit = commits[-1]["commit"]
+
+        rollback = self.client.post(
+            f"/api/admin/files/{first_attachment['relativePath']}/rollback",
+            headers=self.headers,
+            json={"commit": original_attachment_commit},
+        ).get_json()
+
+        self.assertEqual(rollback["status"], "accepted")
+        self.assertEqual(rollback["metadata"]["status"], "accepted")
+        self.assertEqual(rollback["manifest"]["attachments"][0]["kind"], "attachment")
+        self.assertEqual(
+            rollback["manifest"]["attachments"][0]["contentHash"],
+            first_digest,
+        )
+
+        restored = self.client.get(
+            f"/api/attachments/{first_attachment['relativePath']}",
+            headers=self.headers,
+        ).get_json()
+        self.assertEqual(base64.b64decode(restored["content"]), first_content)
+        self.assertEqual(restored["contentHash"], first_digest)
+
+    def test_global_revision_delete_tombstone_does_not_delete_server_file(self):
+        metadata = self.note_metadata()
+        upload = self.client.post(
+            "/api/sync/file",
+            headers=self.headers,
+            json={
+                "clientId": "client-a",
+                "baseRevision": 0,
+                "relativePath": "memo/note.md",
+                "lastKnownRevision": 0,
+                "updatedAtMs": 10,
+                "contentEncoding": "utf-8",
+                "content": "# synced from client a\n",
+                "workspace": {"id": "memo", "name": "memo"},
+                "note": metadata["notes"][0],
+            },
+        ).get_json()
+
+        global_revision_delete = self.client.post(
+            "/api/sync",
+            headers=self.headers,
+            json={
+                "clientId": "client-b",
+                "baseRevision": upload["serverRevision"],
+                "metadata": {
+                    "lastKnownRevision": upload["manifest"]["metadata"]["revision"],
+                    "body": {"version": 1, "workspaces": [], "notes": []},
+                },
+                "files": [
+                    {
+                        "relativePath": "memo/note.md",
+                        "lastKnownRevision": upload["serverRevision"],
+                        "deleted": True,
+                        "updatedAtMs": 20,
+                    }
+                ],
+            },
+        ).get_json()
+
+        self.assertEqual(global_revision_delete["status"], "conflict")
+        self.assertEqual(global_revision_delete["accepted"], [])
+        self.assertEqual(
+            global_revision_delete["conflicts"][0]["relativePath"],
+            "memo/note.md",
+        )
+
+        current = self.client.get(
+            "/api/files/memo/note.md",
+            headers=self.headers,
+        )
+        self.assertEqual(current.status_code, 200)
+        self.assertEqual(self.decoded_content(current.get_json()), "# synced from client a\n")
+
+        plan = self.client.post(
+            "/api/sync/plan",
+            headers=self.headers,
+            json={
+                "clientId": "client-b",
+                "baseRevision": upload["serverRevision"],
+                "metadata": {
+                    "lastKnownRevision": upload["manifest"]["metadata"]["revision"],
+                    "body": {"version": 1, "workspaces": [], "notes": []},
+                },
+                "knownFiles": [
+                    {
+                        "relativePath": "memo/note.md",
+                        "lastKnownRevision": upload["serverRevision"],
+                        "contentHash": upload["file"]["contentHash"],
+                        "deleted": True,
+                    }
+                ],
+            },
+        ).get_json()["plan"]
+
+        self.assertEqual(plan["deleteServerFiles"], [])
+        self.assertTrue(
+            any(
+                item.get("relativePath") == "memo/note.md"
+                for item in plan["conflicts"]
+            )
+        )
 
     def test_manifest_synthesizes_note_title_for_active_file_without_metadata(self):
         self.client.post(
@@ -1329,6 +1823,10 @@ class SyncApiTest(unittest.TestCase):
         self.assertIn("FileVersionResponse", schemas)
         self.assertIn("FileRollbackRequest", schemas)
         self.assertIn("FileRollbackResponse", schemas)
+        self.assertIn(
+            "restoredAttachments",
+            schemas["FileRollbackResponse"]["properties"],
+        )
         self.assertIn("ManifestFileNote", schemas)
         self.assertIn("NoteAttachmentMetadata", schemas)
         self.assertIn("KnownAttachment", schemas)
