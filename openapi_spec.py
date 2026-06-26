@@ -257,6 +257,49 @@ def build_openapi_spec(server_url):
                     },
                 },
             },
+            "/api/admin/storage/reset": {
+                "post": {
+                    "tags": ["Admin"],
+                    "summary": "Reset synced storage state",
+                    "description": (
+                        "Deletes server-side synced files, file history, and metadata "
+                        "so another device can seed the repository from scratch. "
+                        "Admin credentials and issued tokens are kept."
+                    ),
+                    "security": [{"bearerAuth": []}],
+                    "requestBody": {
+                        "required": True,
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": (
+                                        "#/components/schemas/"
+                                        "StorageResetRequest"
+                                    )
+                                },
+                                "example": {"confirm": "RESET"},
+                            }
+                        },
+                    },
+                    "responses": {
+                        "200": {
+                            "description": "Storage reset result.",
+                            "content": {
+                                "application/json": {
+                                    "schema": {
+                                        "$ref": (
+                                            "#/components/schemas/"
+                                            "StorageResetResponse"
+                                        )
+                                    }
+                                }
+                            },
+                        },
+                        "400": {"$ref": "#/components/responses/BadRequest"},
+                        "401": {"$ref": "#/components/responses/Unauthorized"},
+                    },
+                }
+            },
             "/api/admin/files/{relative_path}/history": {
                 "get": {
                     "tags": ["Admin"],
@@ -853,6 +896,29 @@ def build_openapi_spec(server_url):
                     },
                     "additionalProperties": False,
                 },
+                "StorageResetRequest": {
+                    "type": "object",
+                    "required": ["confirm"],
+                    "properties": {
+                        "confirm": {
+                            "type": "string",
+                            "const": "RESET",
+                            "description": "Safety confirmation required for reset.",
+                        }
+                    },
+                    "additionalProperties": False,
+                },
+                "StorageResetResponse": {
+                    "type": "object",
+                    "required": ["status", "resetAt", "manifest"],
+                    "properties": {
+                        "status": {"type": "string", "const": "reset"},
+                        "resetAt": {"type": "string", "format": "date-time"},
+                        "resetBy": {"type": ["string", "null"]},
+                        "manifest": {"$ref": "#/components/schemas/Manifest"},
+                    },
+                    "additionalProperties": False,
+                },
                 "FileHistoryCommit": {
                     "type": "object",
                     "required": [
@@ -938,6 +1004,13 @@ def build_openapi_spec(server_url):
                     "properties": {
                         "status": {"type": "string", "enum": ["accepted", "unchanged"]},
                         "relativePath": {"type": "string"},
+                        "storagePath": {
+                            "type": "string",
+                            "description": (
+                                "Readable server-side file path under storage/files. "
+                                "Use relativePath for sync API addressing."
+                            ),
+                        },
                         "revision": {"type": "integer"},
                         "serverRevision": {"type": "integer"},
                         "contentHash": {"type": ["string", "null"]},
@@ -1057,7 +1130,7 @@ def build_openapi_spec(server_url):
                         },
                         "body": {
                             "type": "object",
-                            "description": "metadata.json body.",
+                            "description": "Notedown metadata body.",
                             "additionalProperties": True,
                         },
                     },
@@ -1354,7 +1427,7 @@ def build_openapi_spec(server_url):
                         },
                         "workspace": {
                             "type": "object",
-                            "description": "Workspace object to merge into metadata.json.",
+                            "description": "Workspace metadata object to merge into the server metadata store.",
                             "additionalProperties": True,
                         },
                         "note": {
@@ -1703,6 +1776,13 @@ def build_openapi_spec(server_url):
                     "required": ["relativePath", "revision", "deleted"],
                     "properties": {
                         "relativePath": {"type": "string"},
+                        "storagePath": {
+                            "type": "string",
+                            "description": (
+                                "Readable server-side file path under storage/files. "
+                                "Use relativePath for sync API addressing."
+                            ),
+                        },
                         "revision": {"type": "integer"},
                         "contentHash": {"type": ["string", "null"]},
                         "size": {"type": "integer"},

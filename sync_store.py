@@ -6,8 +6,11 @@ import json
 import os
 import re
 import shutil
+import sqlite3
 import subprocess
 import threading
+import unicodedata
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 
@@ -17,6 +20,11 @@ class SyncError(ValueError):
 
 
 COMMIT_RE = re.compile(r"^[0-9a-fA-F]{7,40}$")
+CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")
+UNSAFE_FILENAME_RE = re.compile(r'[<>:"\\|?*]+')
+MULTISPACE_RE = re.compile(r"\s+")
+MAX_STORAGE_SEGMENT_LENGTH = 120
+METADATA_DB_SCHEMA_VERSION = 1
 
 
 def utc_now():
@@ -41,14 +49,24 @@ def sha256_json(value):
     return sha256_bytes(payload)
 
 
+def compact_json(value):
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def metadata_json(value):
+    return json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+
+
 def atomic_write_json(path, value):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     temp_path = path.with_name(f".{path.name}.tmp")
-    temp_path.write_text(
-        json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
-    )
+    temp_path.write_text(metadata_json(value), encoding="utf-8")
     os.replace(temp_path, path)
 
 
@@ -78,35 +96,100 @@ def normalize_relative_path(value):
     return str(posix_path)
 
 
+def safe_storage_segment(value, fallback):
+    text = str(value or "").strip()
+    if not text:
+        text = fallback
+
+    text = unicodedata.normalize("NFC", text)
+    text = text.replace("/", " ").replace("\\", " ")
+    text = CONTROL_RE.sub(" ", text)
+    text = UNSAFE_FILENAME_RE.sub(" ", text)
+    text = MULTISPACE_RE.sub(" ", text).strip(" .")
+    if not text or text in (".", ".."):
+        text = fallback
+
+    if len(text) > MAX_STORAGE_SEGMENT_LENGTH:
+        text = text[:MAX_STORAGE_SEGMENT_LENGTH].rstrip(" .")
+
+    return text or fallback
+
+
+def safe_storage_file_name(name, fallback, default_suffix=""):
+    source = str(name or "").strip()
+    suffix = PurePosixPath(source).suffix
+    stem = source[: -len(suffix)] if suffix else source
+    if not suffix and default_suffix:
+        suffix = default_suffix
+
+    safe_stem = safe_storage_segment(stem, fallback)
+    safe_suffix = safe_storage_segment(suffix, default_suffix).replace(" ", "")
+    if safe_suffix and not safe_suffix.startswith("."):
+        safe_suffix = f".{safe_suffix}"
+    return f"{safe_stem}{safe_suffix}"
+
+
 class SyncStore:
     def __init__(self, root):
         self.root = Path(root)
         self.files_root = self.root / "files"
         self.state_path = self.root / "state.json"
-        self.metadata_path = self.root / "metadata.json"
+        self.metadata_db_path = self.root / "metadata.db"
         self.lock = threading.Lock()
 
     def initialize(self):
+        self.root.mkdir(parents=True, exist_ok=True)
         self.files_root.mkdir(parents=True, exist_ok=True)
         self._ensure_git_repo(commit_existing=True)
+        self._ensure_metadata_store()
         if not self.state_path.exists():
             now = utc_now()
-            atomic_write_json(
-                self.state_path,
-                {
-                    "schemaVersion": 1,
-                    "serverRevision": 0,
-                    "createdAt": now,
-                    "updatedAt": now,
-                    "metadata": {
-                        "revision": 0,
-                        "contentHash": None,
-                        "updatedAt": None,
-                    },
-                    "files": {},
-                    "clients": {},
-                },
-            )
+            atomic_write_json(self.state_path, self._initial_state(now))
+
+    def reset_repository(self, user=None):
+        with self.lock:
+            now = utc_now()
+            if self.files_root.exists():
+                shutil.rmtree(self.files_root)
+            for path in (
+                self.metadata_db_path,
+                self.metadata_db_path.with_name(f"{self.metadata_db_path.name}-wal"),
+                self.metadata_db_path.with_name(f"{self.metadata_db_path.name}-shm"),
+            ):
+                try:
+                    path.unlink()
+                except FileNotFoundError:
+                    pass
+
+            self.files_root.mkdir(parents=True, exist_ok=True)
+            self._ensure_git_repo(commit_existing=False)
+            self._ensure_metadata_store()
+            state = self._initial_state(now)
+            if user:
+                state["resetBy"] = user
+            state["resetAt"] = now
+            atomic_write_json(self.state_path, state)
+            return {
+                "status": "reset",
+                "resetAt": now,
+                "resetBy": user,
+                "manifest": self._manifest_from_state(state),
+            }
+
+    def _initial_state(self, now):
+        return {
+            "schemaVersion": 1,
+            "serverRevision": 0,
+            "createdAt": now,
+            "updatedAt": now,
+            "metadata": {
+                "revision": 0,
+                "contentHash": None,
+                "updatedAt": None,
+            },
+            "files": {},
+            "clients": {},
+        }
 
     def manifest(self):
         with self.lock:
@@ -140,7 +223,9 @@ class SyncStore:
     def file_history(self, relative_path):
         with self.lock:
             relative_path = normalize_relative_path(relative_path)
-            commits = self._git_history(relative_path)
+            state = self._load_state()
+            record = state["files"].get(relative_path)
+            commits = self._git_history(relative_path, record)
             return {
                 "relativePath": relative_path,
                 "repoPath": str(self.files_root),
@@ -150,8 +235,10 @@ class SyncStore:
     def file_version_payload(self, relative_path, commit):
         with self.lock:
             relative_path = normalize_relative_path(relative_path)
-            commit = self._resolve_history_commit(relative_path, commit)
-            content = self._git_file_content(relative_path, commit)
+            state = self._load_state()
+            record = state["files"].get(relative_path)
+            commit = self._resolve_history_commit(relative_path, commit, record)
+            content = self._git_file_content(relative_path, commit, record)
             info = self._git_commit_info(commit)
             payload = {
                 "relativePath": relative_path,
@@ -176,11 +263,16 @@ class SyncStore:
     def rollback_file(self, relative_path, commit, user=None):
         with self.lock:
             relative_path = normalize_relative_path(relative_path)
-            commit = self._resolve_history_commit(relative_path, commit)
-            content = self._git_file_content(relative_path, commit)
             state = self._load_state()
             current = state["files"].get(relative_path)
+            commit = self._resolve_history_commit(relative_path, commit, current)
+            content = self._git_file_content(relative_path, commit, current)
             is_attachment = self._is_attachment_record(current)
+            current_storage_path = (
+                self._storage_path_for_record(relative_path, current)
+                if current
+                else None
+            )
             metadata_snapshot = self._metadata_snapshot_for_commit(current, commit)
             current_revision = current.get("revision", 0) if current else 0
             current_deleted = bool(current and current.get("deleted"))
@@ -208,6 +300,7 @@ class SyncStore:
 
             now = utc_now()
             updated_at_ms = utc_now_ms()
+            rollback_storage_path = current_storage_path
             if content is None:
                 if current_deleted:
                     if is_attachment:
@@ -248,7 +341,7 @@ class SyncStore:
                         "deleted": True,
                         "rolledBackToCommit": commit,
                     }
-                file_path = self._file_path(relative_path)
+                file_path = self._file_path(relative_path, current)
                 if file_path.exists():
                     file_path.unlink()
             else:
@@ -309,16 +402,49 @@ class SyncStore:
                         "deleted": False,
                         "rolledBackToCommit": commit,
                     }
-                atomic_write_bytes(self._file_path(relative_path), content)
+                rollback_storage_path = (
+                    current_storage_path
+                    or self._desired_storage_path(
+                        state,
+                        relative_path,
+                        {
+                            "note": note_snapshot,
+                            "attachment": attachment_snapshot,
+                            "noteRelativePath": (
+                                attachment_snapshot or {}
+                            ).get("noteRelativePath")
+                            if isinstance(attachment_snapshot, dict)
+                            else None,
+                        },
+                        "attachment" if is_attachment else "file",
+                        current=current,
+                    )
+                )
+                atomic_write_bytes(
+                    self._file_path(
+                        relative_path,
+                        storage_path=rollback_storage_path,
+                    ),
+                    content,
+                )
 
             state["serverRevision"] += 1
             file_revision = state["serverRevision"]
             message = f"Rollback {relative_path} to {commit[:12]}"
-            git_commit = self._commit_file_change(relative_path, message)
+            rollback_storage_path = rollback_storage_path or self._storage_path_for_record(
+                relative_path,
+                current,
+            )
+            git_commit = self._commit_file_change(
+                relative_path,
+                message,
+                storage_path=rollback_storage_path,
+            )
             history_fields = self._record_history_fields(current)
             if content is None:
                 next_record = {
                     "revision": file_revision,
+                    "storagePath": rollback_storage_path,
                     "contentHash": current_hash,
                     "size": current.get("size", 0) if current else 0,
                     "deleted": True,
@@ -343,6 +469,7 @@ class SyncStore:
             else:
                 next_record = {
                     "revision": file_revision,
+                    "storagePath": rollback_storage_path,
                     "contentHash": target_hash,
                     "size": len(content),
                     "deleted": False,
@@ -438,7 +565,7 @@ class SyncStore:
         with self.lock:
             state = self._load_state()
             now = utc_now()
-            server_metadata = self._read_metadata_body() or self._empty_metadata()
+            server_metadata = self._metadata_index()
             plan = self._build_sync_plan(
                 state,
                 metadata_body,
@@ -459,7 +586,7 @@ class SyncStore:
                 conflicts = [
                     {
                         "type": "metadata",
-                        "relativePath": "metadata.json",
+                        "relativePath": "metadata",
                         "reason": "server_metadata_changed_after_client_base",
                         "serverRevision": metadata["serverRevision"],
                         "clientRevision": metadata_revision,
@@ -796,7 +923,7 @@ class SyncStore:
             }
 
         state["serverRevision"] += 1
-        atomic_write_json(self.metadata_path, body)
+        self._write_metadata_body(body)
         state["metadata"] = {
             "revision": state["serverRevision"],
             "contentHash": content_hash,
@@ -852,6 +979,11 @@ class SyncStore:
         )
         current = state["files"].get(relative_path)
         current_revision = current.get("revision", 0) if current else 0
+        current_storage_path = (
+            self._storage_path_for_record(relative_path, current)
+            if current
+            else None
+        )
         if current and not current.get("deleted") and self._record_kind(current) != kind:
             return {
                 "status": "conflict",
@@ -928,16 +1060,18 @@ class SyncStore:
                     "deleted": True,
                 }
 
-            file_path = self._file_path(relative_path)
+            file_path = self._file_path(relative_path, current)
             if file_path.exists():
                 file_path.unlink()
             state["serverRevision"] += 1
             git_commit = self._commit_file_change(
                 relative_path,
                 f"Delete {relative_path}",
+                storage_path=current_storage_path,
             )
             next_record = {
                 "revision": state["serverRevision"],
+                "storagePath": current_storage_path,
                 "contentHash": current.get("contentHash"),
                 "size": current.get("size", 0),
                 "deleted": True,
@@ -960,6 +1094,7 @@ class SyncStore:
                 "status": "accepted",
                 "relativePath": relative_path,
                 "revision": state["serverRevision"],
+                "storagePath": current_storage_path,
                 "deleted": True,
                 "gitCommit": git_commit,
             }
@@ -972,6 +1107,7 @@ class SyncStore:
                 "status": "unchanged",
                 "relativePath": relative_path,
                 "revision": current_revision,
+                "storagePath": self._storage_path_for_record(relative_path, current),
                 "contentHash": content_hash,
                 "deleted": False,
             }
@@ -980,17 +1116,36 @@ class SyncStore:
             return result
 
         if not hash_only:
-            atomic_write_bytes(self._file_path(relative_path), content)
+            next_storage_path = self._desired_storage_path(
+                state,
+                relative_path,
+                item,
+                kind,
+                current=current,
+            )
+            if current_storage_path:
+                self._move_storage_file_if_needed(
+                    current_storage_path,
+                    next_storage_path,
+                )
+            atomic_write_bytes(
+                self._file_path(relative_path, storage_path=next_storage_path),
+                content,
+            )
             state["serverRevision"] += 1
             git_commit = self._commit_file_change(
                 relative_path,
                 f"Update {relative_path}",
+                storage_path=next_storage_path,
+                previous_storage_path=current_storage_path,
             )
         else:
+            next_storage_path = current_storage_path
             git_commit = current.get("gitCommit")
 
         next_record = {
             "revision": state["serverRevision"],
+            "storagePath": next_storage_path,
             "contentHash": content_hash,
             "size": current.get("size", 0) if hash_only else len(content),
             "deleted": False,
@@ -1013,6 +1168,7 @@ class SyncStore:
             "status": "accepted",
             "relativePath": relative_path,
             "revision": state["serverRevision"],
+            "storagePath": next_storage_path,
             "contentHash": content_hash,
             "deleted": False,
             "gitCommit": git_commit,
@@ -1301,12 +1457,13 @@ class SyncStore:
         }
 
     def _attachment_content_from_history(self, relative_path, content_hash=None):
-        for item in self._git_history(relative_path):
+        record = self._load_state()["files"].get(relative_path)
+        for item in self._git_history(relative_path, record):
             if item.get("deleted"):
                 continue
             if content_hash and item.get("contentHash") != content_hash:
                 continue
-            content = self._git_file_content(relative_path, item["commit"])
+            content = self._git_file_content(relative_path, item["commit"], record)
             if content is not None:
                 return content, item["commit"]
         return None, None
@@ -1350,11 +1507,30 @@ class SyncStore:
             if content is None:
                 continue
 
-            atomic_write_bytes(self._file_path(relative_path), content)
+            storage_path = (
+                self._storage_path_for_record(relative_path, current)
+                if current
+                else self._desired_storage_path(
+                    state,
+                    relative_path,
+                    {
+                        "attachment": attachment,
+                        "note": note_snapshot,
+                        "noteRelativePath": note_relative_path,
+                    },
+                    "attachment",
+                    current=current,
+                )
+            )
+            atomic_write_bytes(
+                self._file_path(relative_path, storage_path=storage_path),
+                content,
+            )
             state["serverRevision"] += 1
             git_commit = self._commit_file_change(
                 relative_path,
                 f"Restore attachment {relative_path} for rollback",
+                storage_path=storage_path,
             )
             attachment_snapshot = self._normalized_attachment_snapshot(
                 attachment,
@@ -1365,6 +1541,7 @@ class SyncStore:
             )
             next_record = {
                 "revision": state["serverRevision"],
+                "storagePath": storage_path,
                 "contentHash": sha256_bytes(content),
                 "size": len(content),
                 "deleted": False,
@@ -1453,7 +1630,7 @@ class SyncStore:
         metadata["generatedAt"] = now
         content_hash = sha256_json(metadata)
         state["serverRevision"] += 1
-        atomic_write_json(self.metadata_path, metadata)
+        self._write_metadata_body(metadata)
         state["metadata"] = {
             "revision": state["serverRevision"],
             "contentHash": content_hash,
@@ -1565,7 +1742,7 @@ class SyncStore:
         metadata["generatedAt"] = now
         content_hash = sha256_json(metadata)
         state["serverRevision"] += 1
-        atomic_write_json(self.metadata_path, metadata)
+        self._write_metadata_body(metadata)
         state["metadata"] = {
             "revision": state["serverRevision"],
             "contentHash": content_hash,
@@ -1617,7 +1794,7 @@ class SyncStore:
         metadata["generatedAt"] = now
         content_hash = sha256_json(metadata)
         state["serverRevision"] += 1
-        atomic_write_json(self.metadata_path, metadata)
+        self._write_metadata_body(metadata)
         state["metadata"] = {
             "revision": state["serverRevision"],
             "contentHash": content_hash,
@@ -1715,7 +1892,7 @@ class SyncStore:
         metadata["generatedAt"] = now
         content_hash = sha256_json(metadata)
         state["serverRevision"] += 1
-        atomic_write_json(self.metadata_path, metadata)
+        self._write_metadata_body(metadata)
         state["metadata"] = {
             "revision": state["serverRevision"],
             "contentHash": content_hash,
@@ -1926,9 +2103,13 @@ class SyncStore:
         base_revision,
     ):
         client_notes = self._notes_by_path(client_metadata)
-        server_notes = self._notes_by_path(server_metadata)
+        if self._is_metadata_index(server_metadata):
+            server_notes = server_metadata["notes"]
+            server_workspaces = server_metadata["workspaces"]
+        else:
+            server_notes = self._notes_by_path(server_metadata)
+            server_workspaces = self._workspaces_by_id(server_metadata)
         client_workspaces = self._workspaces_by_id(client_metadata)
-        server_workspaces = self._workspaces_by_id(server_metadata)
         note_file_paths = {
             relative_path
             for relative_path, record in state["files"].items()
@@ -2202,7 +2383,10 @@ class SyncStore:
         base_revision,
     ):
         client_attachments = self._attachments_by_path(client_metadata)
-        server_attachments = self._attachments_by_path(server_metadata)
+        if self._is_metadata_index(server_metadata):
+            server_attachments = server_metadata["attachments"]
+        else:
+            server_attachments = self._attachments_by_path(server_metadata)
         server_records = {
             relative_path: record
             for relative_path, record in state["files"].items()
@@ -2499,7 +2683,11 @@ class SyncStore:
             "serverHash": server_hash,
         }
         if status in ("diverged", "client_changed"):
-            result["serverMetadata"] = server_metadata
+            result["serverMetadata"] = (
+                self._read_metadata_body()
+                if self._is_metadata_index(server_metadata)
+                else server_metadata
+            )
         return result
 
     def _notes_by_path(self, metadata):
@@ -2737,6 +2925,7 @@ class SyncStore:
             return None
         payload = {
             "relativePath": relative_path,
+            "storagePath": self._storage_path_for_record(relative_path, record),
             "revision": record.get("revision", 0),
             "contentHash": record.get("contentHash"),
             "size": record.get("size", 0),
@@ -2939,6 +3128,150 @@ class SyncStore:
     def _is_attachment_record(self, record):
         return bool(record and record.get("kind") == "attachment")
 
+    def _storage_path_for_record(self, relative_path, record=None):
+        storage_path = record.get("storagePath") if isinstance(record, dict) else None
+        return normalize_relative_path(storage_path or relative_path)
+
+    def _desired_storage_path(self, state, relative_path, item, kind, current=None):
+        if kind == "attachment":
+            desired = self._desired_attachment_storage_path(relative_path, item, current)
+        else:
+            desired = self._desired_note_storage_path(relative_path, item, current)
+        return self._unique_storage_path(state, relative_path, desired)
+
+    def _desired_note_storage_path(self, relative_path, item, current=None):
+        note = item.get("note") if isinstance(item.get("note"), dict) else {}
+        path = PurePosixPath(relative_path)
+        parts = self._storage_folder_parts_for_note(note, relative_path)
+        fallback_stem = path.stem or "note"
+        title = note.get("title") or fallback_stem
+        suffix = path.suffix or ".md"
+        filename = safe_storage_file_name(title, fallback_stem, suffix)
+        return normalize_relative_path(str(PurePosixPath(*parts, filename)))
+
+    def _storage_folder_parts_for_note(self, note, relative_path):
+        note = note if isinstance(note, dict) else {}
+        path = PurePosixPath(relative_path)
+        folder = note.get("folder")
+        if not folder:
+            parent = str(path.parent)
+            folder = "" if parent == "." else parent
+
+        raw_parts = [
+            part
+            for part in str(folder).replace("\\", "/").split("/")
+            if part and part not in (".", "..")
+        ]
+        workspace_id = note.get("workspace")
+        workspace_name = note.get("workspaceName")
+        workspace_first = (
+            str(workspace_id).replace("\\", "/").split("/", 1)[0]
+            if workspace_id
+            else None
+        )
+        if workspace_name:
+            if raw_parts:
+                first = raw_parts[0]
+                if (
+                    not workspace_id
+                    or first == workspace_id
+                    or first == workspace_first
+                    or first in ("unfiled", "미지정 워크스페이스")
+                ):
+                    raw_parts[0] = workspace_name
+            else:
+                raw_parts = [workspace_name]
+
+        return [
+            safe_storage_segment(part, "folder")
+            for part in raw_parts
+            if part and part not in (".", "..")
+        ]
+
+    def _desired_attachment_storage_path(self, relative_path, item, current=None):
+        attachment = (
+            item.get("attachment") if isinstance(item.get("attachment"), dict) else {}
+        )
+        note = item.get("note") if isinstance(item.get("note"), dict) else {}
+        note_relative_path = (
+            item.get("noteRelativePath")
+            or attachment.get("noteRelativePath")
+            or note.get("relativePath")
+            or (current or {}).get("noteRelativePath")
+        )
+        note_relative_path = (
+            normalize_relative_path(note_relative_path)
+            if note_relative_path
+            else str(PurePosixPath(relative_path).parent)
+        )
+        note_path = PurePosixPath(note_relative_path)
+        parts = self._storage_folder_parts_for_note(note, note_relative_path)
+        if not parts:
+            note_parent = str(note_path.parent)
+            parts = [
+                safe_storage_segment(part, "folder")
+                for part in note_parent.replace("\\", "/").split("/")
+                if part and part not in (".", "..")
+            ]
+        note_label = note.get("title") or note_path.stem or "note"
+        file_name = (
+            attachment.get("fileName")
+            or item.get("fileName")
+            or PurePosixPath(relative_path).name
+            or "attachment"
+        )
+        parts.extend(["attachments", safe_storage_segment(note_label, "note")])
+        filename = safe_storage_file_name(file_name, "attachment")
+        return normalize_relative_path(str(PurePosixPath(*parts, filename)))
+
+    def _unique_storage_path(self, state, relative_path, desired_path):
+        desired_path = normalize_relative_path(desired_path)
+        used_paths = {
+            self._storage_path_for_record(path, record)
+            for path, record in state["files"].items()
+            if path != relative_path and not record.get("deleted")
+        }
+        if desired_path not in used_paths:
+            return desired_path
+
+        path = PurePosixPath(desired_path)
+        suffix = path.suffix
+        stem = path.name[: -len(suffix)] if suffix else path.name
+        digest = hashlib.sha1(relative_path.encode("utf-8")).hexdigest()[:8]
+        for index in range(1000):
+            marker = digest if index == 0 else f"{digest}-{index + 1}"
+            candidate = str(path.with_name(f"{stem}-{marker}{suffix}"))
+            if candidate not in used_paths:
+                return normalize_relative_path(candidate)
+        raise SyncError("Unable to allocate a unique storage path.")
+
+    def _move_storage_file_if_needed(self, previous_storage_path, next_storage_path):
+        previous_storage_path = normalize_relative_path(previous_storage_path)
+        next_storage_path = normalize_relative_path(next_storage_path)
+        if previous_storage_path == next_storage_path:
+            return
+
+        previous_path = self._file_path_from_storage_path(previous_storage_path)
+        next_path = self._file_path_from_storage_path(next_storage_path)
+        if not previous_path.exists():
+            return
+
+        next_path.parent.mkdir(parents=True, exist_ok=True)
+        if next_path.exists():
+            raise SyncError("Target storage path already exists.")
+        previous_path.rename(next_path)
+        self._prune_empty_dirs(previous_path.parent)
+
+    def _prune_empty_dirs(self, start):
+        current = Path(start)
+        root = self.files_root.resolve()
+        while current.exists() and current.resolve() != root:
+            try:
+                current.rmdir()
+            except OSError:
+                break
+            current = current.parent
+
     def _remote_changes_since(
         self,
         state,
@@ -2963,14 +3296,13 @@ class SyncStore:
         if not payload["deleted"]:
             payload["contentEncoding"] = "base64"
             payload["content"] = base64.b64encode(
-                self._file_path(relative_path).read_bytes()
+                self._file_path(relative_path, record).read_bytes()
             ).decode("ascii")
 
         return payload
 
     def _manifest_from_state(self, state):
-        metadata_body = self._read_metadata_body() or self._empty_metadata()
-        notes_by_path = self._notes_by_path(metadata_body)
+        notes_by_path = self._metadata_notes_by_path()
         files = []
         attachments = []
         for relative_path, record in sorted(state["files"].items()):
@@ -2983,11 +3315,11 @@ class SyncStore:
                     attachment_record["note"] = note_record
                 attachments.append(attachment_record)
             else:
-                file_record = {"relativePath": relative_path, **record}
+                file_record = self._file_record(relative_path, record)
                 note = notes_by_path.get(relative_path) or record.get("deletedNote")
                 if not note and not record.get("deleted"):
                     content = None
-                    file_path = self._file_path(relative_path)
+                    file_path = self._file_path(relative_path, record)
                     if file_path.exists():
                         try:
                             content = file_path.read_bytes()
@@ -3041,26 +3373,40 @@ class SyncStore:
         if self._staged_changes_exist():
             self._run_git("commit", "-m", "Initialize Notedown file history")
 
-    def _commit_file_change(self, relative_path, message):
+    def _commit_file_change(
+        self,
+        relative_path,
+        message,
+        storage_path=None,
+        previous_storage_path=None,
+    ):
         relative_path = normalize_relative_path(relative_path)
+        storage_path = normalize_relative_path(storage_path or relative_path)
+        paths = [storage_path]
+        if previous_storage_path:
+            previous_storage_path = normalize_relative_path(previous_storage_path)
+            if previous_storage_path not in paths:
+                paths.append(previous_storage_path)
         self._ensure_git_repo()
-        self._run_git("add", "-A", "--", relative_path)
+        self._run_git("add", "-A", "--", *paths)
         if self._staged_changes_exist():
             self._run_git("commit", "-m", message)
         return self._git_head()
 
-    def _git_history(self, relative_path):
+    def _git_history(self, relative_path, record=None):
         relative_path = normalize_relative_path(relative_path)
+        storage_path = self._storage_path_for_record(relative_path, record)
         self._ensure_git_repo(commit_existing=True)
         if not self._has_git_head():
             return []
 
         output = self._run_git(
             "log",
+            "--follow",
             "--date=iso-strict",
             "--pretty=format:%H%x1f%h%x1f%aI%x1f%an%x1f%s",
             "--",
-            relative_path,
+            storage_path,
         ).stdout.strip()
         if not output:
             return []
@@ -3071,7 +3417,12 @@ class SyncStore:
             if len(parts) != 5:
                 continue
             commit, short_commit, committed_at, author, message = parts
-            content = self._git_file_content(relative_path, commit)
+            content = self._git_file_content(
+                relative_path,
+                commit,
+                record,
+                storage_path=storage_path,
+            )
             commits.append(
                 {
                     "commit": commit,
@@ -3086,7 +3437,7 @@ class SyncStore:
             )
         return commits
 
-    def _resolve_history_commit(self, relative_path, commit):
+    def _resolve_history_commit(self, relative_path, commit, record=None):
         relative_path = normalize_relative_path(relative_path)
         if not isinstance(commit, str) or not COMMIT_RE.fullmatch(commit.strip()):
             raise SyncError("commit must be a git commit hash.")
@@ -3100,7 +3451,7 @@ class SyncStore:
 
         history_commits = {
             item["commit"]
-            for item in self._git_history(relative_path)
+            for item in self._git_history(relative_path, record)
         }
         if resolved not in history_commits:
             raise SyncError("commit is not part of the file history.")
@@ -3126,17 +3477,25 @@ class SyncStore:
             "message": message,
         }
 
-    def _git_file_content(self, relative_path, commit):
+    def _git_file_content(self, relative_path, commit, record=None, storage_path=None):
         relative_path = normalize_relative_path(relative_path)
-        result = self._run_git(
-            "cat-file",
-            "-e",
-            f"{commit}:{relative_path}",
-            check=False,
+        storage_path = normalize_relative_path(
+            storage_path or self._storage_path_for_record(relative_path, record)
         )
-        if result.returncode != 0:
-            return None
-        return self._run_git_bytes("show", f"{commit}:{relative_path}").stdout
+        candidate_paths = [storage_path]
+        if relative_path not in candidate_paths:
+            candidate_paths.append(relative_path)
+
+        for candidate in candidate_paths:
+            result = self._run_git(
+                "cat-file",
+                "-e",
+                f"{commit}:{candidate}",
+                check=False,
+            )
+            if result.returncode == 0:
+                return self._run_git_bytes("show", f"{commit}:{candidate}").stdout
+        return None
 
     def _has_git_head(self):
         result = self._run_git(
@@ -3200,10 +3559,358 @@ class SyncStore:
         self.initialize()
         return json.loads(self.state_path.read_text(encoding="utf-8"))
 
+    @contextmanager
+    def _metadata_connection(self):
+        self.root.mkdir(parents=True, exist_ok=True)
+        connection = sqlite3.connect(self.metadata_db_path)
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA foreign_keys = ON")
+        try:
+            yield connection
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def _ensure_metadata_store(self):
+        with self._metadata_connection() as connection:
+            connection.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS metadata_document (
+                    id INTEGER PRIMARY KEY CHECK (id = 1),
+                    schema_version INTEGER NOT NULL,
+                    version INTEGER NOT NULL,
+                    generated_at TEXT,
+                    extra_json TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS metadata_workspaces (
+                    id TEXT PRIMARY KEY,
+                    position INTEGER NOT NULL,
+                    body_json TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS metadata_notes (
+                    relative_path TEXT PRIMARY KEY,
+                    note_id TEXT,
+                    workspace_id TEXT,
+                    title TEXT,
+                    updated_at_ms INTEGER,
+                    position INTEGER NOT NULL,
+                    body_json TEXT NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_metadata_notes_workspace
+                    ON metadata_notes(workspace_id);
+                CREATE INDEX IF NOT EXISTS idx_metadata_notes_updated
+                    ON metadata_notes(updated_at_ms);
+
+                CREATE TABLE IF NOT EXISTS metadata_attachments (
+                    relative_path TEXT PRIMARY KEY,
+                    note_relative_path TEXT NOT NULL,
+                    attachment_id TEXT,
+                    position INTEGER NOT NULL,
+                    body_json TEXT NOT NULL,
+                    FOREIGN KEY(note_relative_path)
+                        REFERENCES metadata_notes(relative_path)
+                        ON DELETE CASCADE
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_metadata_attachments_note
+                    ON metadata_attachments(note_relative_path);
+                """
+            )
+            document = connection.execute(
+                "SELECT schema_version FROM metadata_document WHERE id = 1"
+            ).fetchone()
+            if document is None:
+                self._replace_metadata_body(connection, self._empty_metadata())
+
+    def _metadata_has_rows(self, connection):
+        for table in (
+            "metadata_workspaces",
+            "metadata_notes",
+            "metadata_attachments",
+        ):
+            row = connection.execute(f"SELECT COUNT(*) AS count FROM {table}").fetchone()
+            if row and row["count"]:
+                return True
+        return False
+
+    def _replace_metadata_body(self, connection, body):
+        if not isinstance(body, dict):
+            raise SyncError("metadata body must be an object.")
+
+        workspaces = body.get("workspaces", [])
+        notes = body.get("notes", [])
+        if not isinstance(workspaces, list):
+            raise SyncError("metadata.workspaces must be a list.")
+        if not isinstance(notes, list):
+            raise SyncError("metadata.notes must be a list.")
+
+        extra = {
+            key: copy.deepcopy(value)
+            for key, value in body.items()
+            if key not in ("version", "generatedAt", "workspaces", "notes")
+        }
+        version = self._to_int(body.get("version", 1), "metadata.version")
+        generated_at = body.get("generatedAt")
+
+        connection.execute("DELETE FROM metadata_attachments")
+        connection.execute("DELETE FROM metadata_notes")
+        connection.execute("DELETE FROM metadata_workspaces")
+        connection.execute("DELETE FROM metadata_document")
+        connection.execute(
+            """
+            INSERT INTO metadata_document (
+                id,
+                schema_version,
+                version,
+                generated_at,
+                extra_json
+            )
+            VALUES (1, ?, ?, ?, ?)
+            """,
+            (
+                METADATA_DB_SCHEMA_VERSION,
+                version,
+                generated_at,
+                compact_json(extra),
+            ),
+        )
+
+        for position, workspace in enumerate(workspaces):
+            if not isinstance(workspace, dict):
+                raise SyncError("Each metadata workspace must be an object.")
+            workspace_id = workspace.get("id")
+            if not workspace_id:
+                continue
+            connection.execute(
+                """
+                INSERT OR REPLACE INTO metadata_workspaces (
+                    id,
+                    position,
+                    body_json
+                )
+                VALUES (?, ?, ?)
+                """,
+                (workspace_id, position, compact_json(workspace)),
+            )
+
+        for position, note in enumerate(notes):
+            if not isinstance(note, dict):
+                raise SyncError("Each metadata note must be an object.")
+            relative_path = note.get("relativePath")
+            if not relative_path:
+                continue
+            relative_path = normalize_relative_path(relative_path)
+            note_body = dict(note)
+            note_body["relativePath"] = relative_path
+            had_attachments = "attachments" in note_body
+            attachments = note_body.get("attachments", [])
+            if attachments is None:
+                attachments = []
+            if not isinstance(attachments, list):
+                raise SyncError("note.attachments must be a list.")
+            if had_attachments:
+                note_body["attachments"] = []
+            else:
+                note_body.pop("attachments", None)
+            updated_at_ms = note_body.get("updatedAtMs")
+            updated_at_ms = (
+                self._to_int(updated_at_ms, "note.updatedAtMs")
+                if updated_at_ms is not None
+                else None
+            )
+            connection.execute(
+                """
+                INSERT OR REPLACE INTO metadata_notes (
+                    relative_path,
+                    note_id,
+                    workspace_id,
+                    title,
+                    updated_at_ms,
+                    position,
+                    body_json
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    relative_path,
+                    note_body.get("id"),
+                    note_body.get("workspace"),
+                    note_body.get("title"),
+                    updated_at_ms,
+                    position,
+                    compact_json(note_body),
+                ),
+            )
+
+            for attachment_position, attachment in enumerate(attachments):
+                if not isinstance(attachment, dict):
+                    raise SyncError("Each note attachment must be an object.")
+                attachment_relative_path = attachment.get("relativePath")
+                if not attachment_relative_path:
+                    continue
+                attachment_relative_path = normalize_relative_path(
+                    attachment_relative_path
+                )
+                attachment_body = dict(attachment)
+                attachment_body["relativePath"] = attachment_relative_path
+                attachment_body.setdefault("noteRelativePath", relative_path)
+                connection.execute(
+                    """
+                    INSERT OR REPLACE INTO metadata_attachments (
+                        relative_path,
+                        note_relative_path,
+                        attachment_id,
+                        position,
+                        body_json
+                    )
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (
+                        attachment_relative_path,
+                        relative_path,
+                        attachment_body.get("id")
+                        or attachment_body.get("attachmentId"),
+                        attachment_position,
+                        compact_json(attachment_body),
+                    ),
+                )
+
+    def _write_metadata_body(self, body):
+        self._ensure_metadata_store()
+        with self._metadata_connection() as connection:
+            self._replace_metadata_body(connection, body)
+
+    def _is_metadata_index(self, value):
+        return isinstance(value, dict) and value.get("__metadataIndex") is True
+
+    def _metadata_index(self):
+        self._ensure_metadata_store()
+        with self._metadata_connection() as connection:
+            notes = self._metadata_notes_by_path(connection)
+            workspaces = {
+                workspace.get("id"): workspace
+                for workspace in (
+                    json.loads(row["body_json"])
+                    for row in connection.execute(
+                        """
+                        SELECT body_json
+                        FROM metadata_workspaces
+                        ORDER BY position, id
+                        """
+                    )
+                )
+                if workspace.get("id")
+            }
+            attachments = {}
+            for row in connection.execute(
+                """
+                SELECT relative_path, note_relative_path, body_json
+                FROM metadata_attachments
+                ORDER BY note_relative_path, position, relative_path
+                """
+            ):
+                attachment = json.loads(row["body_json"])
+                attachment["relativePath"] = row["relative_path"]
+                attachment.setdefault("noteRelativePath", row["note_relative_path"])
+                note = notes.get(row["note_relative_path"])
+                if note and note.get("id"):
+                    attachment.setdefault("noteId", note.get("id"))
+                attachments[row["relative_path"]] = {
+                    "attachment": attachment,
+                    "note": note,
+                }
+
+            return {
+                "__metadataIndex": True,
+                "notes": notes,
+                "workspaces": workspaces,
+                "attachments": attachments,
+            }
+
+    def _metadata_notes_by_path(self, connection=None):
+        if connection is None:
+            self._ensure_metadata_store()
+            with self._metadata_connection() as next_connection:
+                return self._metadata_notes_by_path(next_connection)
+
+        notes = {}
+        for row in connection.execute(
+            """
+            SELECT relative_path, body_json
+            FROM metadata_notes
+            ORDER BY position, relative_path
+            """
+        ):
+            note = json.loads(row["body_json"])
+            note["relativePath"] = row["relative_path"]
+            notes[row["relative_path"]] = note
+        return notes
+
     def _read_metadata_body(self):
-        if not self.metadata_path.exists():
-            return None
-        return json.loads(self.metadata_path.read_text(encoding="utf-8"))
+        self._ensure_metadata_store()
+        with self._metadata_connection() as connection:
+            document = connection.execute(
+                """
+                SELECT version, generated_at, extra_json
+                FROM metadata_document
+                WHERE id = 1
+                """
+            ).fetchone()
+            if document is None:
+                return None
+
+            try:
+                body = json.loads(document["extra_json"] or "{}")
+            except json.JSONDecodeError as exc:
+                raise SyncError("Stored metadata is invalid.") from exc
+
+            body["version"] = document["version"]
+            body["generatedAt"] = document["generated_at"]
+            body["workspaces"] = [
+                json.loads(row["body_json"])
+                for row in connection.execute(
+                    """
+                    SELECT body_json
+                    FROM metadata_workspaces
+                    ORDER BY position, id
+                    """
+                )
+            ]
+
+            notes = []
+            note_rows = connection.execute(
+                """
+                SELECT relative_path, body_json
+                FROM metadata_notes
+                ORDER BY position, relative_path
+                """
+            ).fetchall()
+            for note_row in note_rows:
+                note = json.loads(note_row["body_json"])
+                note["relativePath"] = note_row["relative_path"]
+                attachments = [
+                    json.loads(row["body_json"])
+                    for row in connection.execute(
+                        """
+                        SELECT body_json
+                        FROM metadata_attachments
+                        WHERE note_relative_path = ?
+                        ORDER BY position, relative_path
+                        """,
+                        (note_row["relative_path"],),
+                    )
+                ]
+                if attachments or "attachments" in note:
+                    note["attachments"] = attachments
+                notes.append(note)
+            body["notes"] = notes
+            return body
 
     def _decode_content(self, item, relative_path):
         if "content" not in item:
@@ -3226,9 +3933,13 @@ class SyncStore:
 
         raise SyncError(f"{relative_path}.contentEncoding is unsupported.")
 
-    def _file_path(self, relative_path):
-        relative_path = normalize_relative_path(relative_path)
-        target = (self.files_root / relative_path).resolve()
+    def _file_path(self, relative_path, record=None, storage_path=None):
+        storage_path = storage_path or self._storage_path_for_record(relative_path, record)
+        return self._file_path_from_storage_path(storage_path)
+
+    def _file_path_from_storage_path(self, storage_path):
+        storage_path = normalize_relative_path(storage_path)
+        target = (self.files_root / storage_path).resolve()
         files_root = self.files_root.resolve()
         if files_root not in target.parents and target != files_root:
             raise SyncError("Resolved file path escapes the storage directory.")

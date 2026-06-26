@@ -1,6 +1,7 @@
 import base64
 import hashlib
 import unittest
+from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from app import create_app
@@ -170,6 +171,56 @@ class SyncApiTest(unittest.TestCase):
         self.assertEqual(rejected.status_code, 401)
         self.assertEqual(rejected.get_json()["error"], "invalid_token")
 
+    def test_admin_can_reset_storage_for_resync(self):
+        metadata = self.note_metadata()
+        upload = self.client.post(
+            "/api/sync/file",
+            headers=self.headers,
+            json={
+                "clientId": "client-a",
+                "baseRevision": 0,
+                "relativePath": "memo/note.md",
+                "lastKnownRevision": 0,
+                "updatedAtMs": 10,
+                "contentEncoding": "utf-8",
+                "content": "# hello\n",
+                "workspace": {"id": "memo", "name": "memo"},
+                "note": metadata["notes"][0],
+            },
+        ).get_json()
+        self.assertGreater(upload["serverRevision"], 0)
+        self.assertTrue(
+            (Path(self.tempdir.name) / "files" / "memo" / "새 노트.md").exists()
+        )
+
+        rejected = self.client.post(
+            "/api/admin/storage/reset",
+            headers=self.headers,
+            json={"confirm": "NO"},
+        )
+        self.assertEqual(rejected.status_code, 400)
+
+        reset = self.client.post(
+            "/api/admin/storage/reset",
+            headers=self.headers,
+            json={"confirm": "RESET"},
+        )
+
+        self.assertEqual(reset.status_code, 200)
+        payload = reset.get_json()
+        self.assertEqual(payload["status"], "reset")
+        manifest = payload["manifest"]
+        self.assertEqual(manifest["serverRevision"], 0)
+        self.assertEqual(manifest["files"], [])
+        self.assertEqual(manifest["attachments"], [])
+        self.assertEqual(manifest["metadata"]["revision"], 0)
+        self.assertFalse((Path(self.tempdir.name) / "metadata.json").exists())
+        self.assertTrue((Path(self.tempdir.name) / "metadata.db").exists())
+
+        still_authenticated = self.client.get("/api/manifest", headers=self.headers)
+        self.assertEqual(still_authenticated.status_code, 200)
+        self.assertEqual(still_authenticated.get_json()["serverRevision"], 0)
+
     def test_update_file_backed_admin_credentials(self):
         with TemporaryDirectory() as tempdir:
             app = create_app(
@@ -307,6 +358,91 @@ class SyncApiTest(unittest.TestCase):
         self.assertEqual(manifest_file["note"]["title"], "새 노트")
         self.assertEqual(manifest_file["note"]["folder"], "memo")
         self.assertNotIn("id", manifest_file["note"])
+
+    def test_file_upload_uses_readable_storage_path_and_sqlite_metadata(self):
+        metadata = self.note_metadata()
+        metadata["notes"][0]["id"] = "note-f7fdc36f7aad279d"
+        metadata["notes"][0]["title"] = "회의 기록"
+        metadata["notes"][0]["fileName"] = "note-1779945632257.md"
+        metadata["notes"][0]["relativePath"] = "memo/note-1779945632257.md"
+
+        response = self.client.post(
+            "/api/sync/file",
+            headers=self.headers,
+            json={
+                "clientId": "client-a",
+                "baseRevision": 0,
+                "relativePath": "memo/note-1779945632257.md",
+                "lastKnownRevision": 0,
+                "updatedAtMs": 10,
+                "contentEncoding": "utf-8",
+                "content": "# 회의 기록\n",
+                "workspace": {"id": "memo", "name": "memo"},
+                "note": metadata["notes"][0],
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        upload = response.get_json()
+        self.assertEqual(upload["file"]["storagePath"], "memo/회의 기록.md")
+
+        storage_root = Path(self.tempdir.name)
+        self.assertTrue((storage_root / "metadata.db").exists())
+        self.assertFalse((storage_root / "metadata.json").exists())
+        self.assertTrue((storage_root / "files" / "memo" / "회의 기록.md").exists())
+        self.assertFalse(
+            (storage_root / "files" / "memo" / "note-1779945632257.md").exists()
+        )
+
+        download = self.client.get(
+            "/api/files/memo/note-1779945632257.md",
+            headers=self.headers,
+        ).get_json()
+        self.assertEqual(self.decoded_content(download), "# 회의 기록\n")
+        self.assertEqual(download["storagePath"], "memo/회의 기록.md")
+
+    def test_attachment_upload_uses_readable_note_storage_path(self):
+        content = b"\x89PNG\r\nreadable-attachment"
+        digest = hashlib.sha256(content).hexdigest()
+        metadata = self.note_metadata()
+        metadata["notes"][0]["title"] = "첨부 노트"
+        attachment = self.attachment_metadata(content)
+
+        response = self.client.post(
+            "/api/sync/attachment",
+            headers=self.headers,
+            json={
+                "clientId": "client-a",
+                "baseRevision": 0,
+                "noteRelativePath": "memo/note.md",
+                "relativePath": attachment["relativePath"],
+                "lastKnownRevision": 0,
+                "updatedAtMs": attachment["updatedAtMs"],
+                "contentEncoding": "base64",
+                "content": base64.b64encode(content).decode("ascii"),
+                "contentHash": digest,
+                "workspace": {"id": "memo", "name": "memo"},
+                "note": metadata["notes"][0],
+                "attachment": attachment,
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        upload = response.get_json()
+        self.assertEqual(
+            upload["attachment"]["storagePath"],
+            "memo/attachments/첨부 노트/diagram.png",
+        )
+        self.assertTrue(
+            (
+                Path(self.tempdir.name)
+                / "files"
+                / "memo"
+                / "attachments"
+                / "첨부 노트"
+                / "diagram.png"
+            ).exists()
+        )
 
     def test_attachment_upload_download_and_plan_checksum(self):
         content = b"\x89PNG\r\nnotedown-image"

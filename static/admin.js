@@ -15,6 +15,7 @@ const els = {
   status: document.querySelector("#server-status"),
   dashboard: document.querySelector("#dashboard"),
   refresh: document.querySelector("#refresh-button"),
+  resetStorage: document.querySelector("#reset-storage-button"),
   accountButton: document.querySelector("#account-button"),
   logout: document.querySelector("#logout-button"),
   menuButtons: document.querySelectorAll("[data-admin-section]"),
@@ -729,6 +730,33 @@ async function revokeToken(tokenId) {
   setStatus("토큰 무효화됨");
 }
 
+async function resetStorage() {
+  const firstConfirm = window.confirm(
+    "서버 저장소의 동기화 파일과 메타데이터를 모두 초기화할까요? 관리자 계정과 토큰은 유지됩니다."
+  );
+  if (!firstConfirm) return;
+
+  const typed = window.prompt('초기화하려면 RESET을 입력하세요.');
+  if (typed !== "RESET") {
+    setStatus("저장소 초기화 취소됨");
+    return;
+  }
+
+  setStatus("저장소 초기화 중");
+  await requestJson("/api/admin/storage/reset", {
+    method: "POST",
+    body: JSON.stringify({ confirm: "RESET" }),
+  });
+  state.selectedPath = null;
+  state.selectedAttachmentPath = null;
+  state.selectedHistoryCommit = null;
+  state.history = [];
+  revokeSelectedAttachmentUrl();
+  els.preview.textContent = "파일 행을 선택하면 내용이 표시됩니다.";
+  await loadManifest();
+  setStatus("저장소 초기화됨");
+}
+
 function friendlyError(error) {
   return ERROR_MESSAGES[error.message] || error.message;
 }
@@ -826,6 +854,9 @@ els.refresh.addEventListener("click", () => loadManifest().catch((error) => {
   }
 }));
 els.accountButton.addEventListener("click", openAccountModal);
+els.resetStorage.addEventListener("click", () => {
+  resetStorage().catch((error) => setStatus(error.message));
+});
 els.logout.addEventListener("click", logout);
 els.menuButtons.forEach((button) => {
   button.addEventListener("click", () => setActiveSection(button.dataset.adminSection));

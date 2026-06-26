@@ -318,6 +318,14 @@ def create_app(test_config=None):
             return jsonify({"error": "token_not_found"}), 404
         return jsonify({"status": "deleted", "tokenId": token_id})
 
+    @app.post("/api/admin/storage/reset")
+    @auth_required
+    def reset_admin_storage():
+        payload = request.get_json(silent=True) or {}
+        if payload.get("confirm") != "RESET":
+            raise SyncError('confirm must be "RESET".')
+        return jsonify(store.reset_repository(user=request.current_user))
+
     @app.get("/api/manifest")
     @auth_required
     def manifest():

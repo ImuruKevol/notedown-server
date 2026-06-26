@@ -5,3 +5,4 @@ __pycache__/
 .env
 storage/
 AGENTS.md
+.DS_Store
