@@ -5,6 +5,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from app import create_app
+from sync_store import sha256_json
 
 
 class SyncApiTest(unittest.TestCase):
@@ -67,6 +68,28 @@ class SyncApiTest(unittest.TestCase):
             "size": len(content),
             "contentHash": digest,
             "updatedAtMs": 11,
+        }
+
+    def unfiled_directory_metadata(self):
+        return {
+            "version": 1,
+            "generatedAt": "2026-06-30T10:07:36.000Z",
+            "workspaces": [
+                {"id": "unfiled", "name": "미지정 워크스페이스"},
+                {"id": "미지정-워크스페이스", "name": "미지정 워크스페이스"},
+            ],
+            "notes": [
+                {
+                    "id": "note-unfiled",
+                    "title": "Memo",
+                    "workspace": "unfiled",
+                    "workspaceName": "미지정 워크스페이스",
+                    "folder": "unfiled",
+                    "fileName": "Memo.md",
+                    "relativePath": "미지정 워크스페이스/Memo.md",
+                    "updatedAtMs": 10,
+                }
+            ],
         }
 
     def test_push_and_manifest(self):
@@ -401,6 +424,92 @@ class SyncApiTest(unittest.TestCase):
         self.assertEqual(self.decoded_content(download), "# 회의 기록\n")
         self.assertEqual(download["storagePath"], "memo/회의 기록.md")
 
+    def test_file_upload_normalizes_workspace_alias_to_directory_folder(self):
+        metadata = self.unfiled_directory_metadata()
+
+        response = self.client.post(
+            "/api/sync/file",
+            headers=self.headers,
+            json={
+                "clientId": "client-a",
+                "baseRevision": 0,
+                "relativePath": "미지정 워크스페이스/Memo.md",
+                "lastKnownRevision": 0,
+                "updatedAtMs": 10,
+                "contentEncoding": "utf-8",
+                "content": "# Memo\n",
+                "workspace": {"id": "unfiled", "name": "미지정 워크스페이스"},
+                "note": metadata["notes"][0],
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        upload = response.get_json()
+        note = upload["manifest"]["files"][0]["note"]
+        self.assertEqual(note["folder"], "미지정 워크스페이스")
+        self.assertEqual(note["workspace"], "미지정 워크스페이스")
+        self.assertEqual(note["workspaceName"], "미지정 워크스페이스")
+
+        plan = self.client.post(
+            "/api/sync/plan",
+            headers=self.headers,
+            json={
+                "clientId": "client-b",
+                "baseRevision": 0,
+                "metadata": {
+                    "lastKnownRevision": 0,
+                    "body": {"version": 1, "workspaces": [], "notes": []},
+                },
+            },
+        ).get_json()["plan"]
+
+        download = plan["downloadFiles"][0]
+        self.assertEqual(download["note"]["folder"], "미지정 워크스페이스")
+        self.assertEqual(download["workspace"]["id"], "미지정 워크스페이스")
+
+    def test_metadata_sync_normalizes_workspace_alias_to_directory_folder(self):
+        metadata = self.unfiled_directory_metadata()
+
+        response = self.client.post(
+            "/api/sync",
+            headers=self.headers,
+            json={
+                "clientId": "client-a",
+                "baseRevision": 0,
+                "metadata": {
+                    "lastKnownRevision": 0,
+                    "contentHash": sha256_json(metadata),
+                    "body": metadata,
+                },
+                "files": [],
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        sync_payload = response.get_json()
+        self.assertEqual(sync_payload["metadata"]["status"], "accepted")
+
+        plan_payload = self.client.post(
+            "/api/sync/plan",
+            headers=self.headers,
+            json={
+                "clientId": "client-b",
+                "baseRevision": 0,
+                "metadata": {
+                    "lastKnownRevision": 0,
+                    "body": {"version": 1, "workspaces": [], "notes": []},
+                },
+            },
+        ).get_json()
+        server_metadata = plan_payload["metadata"]["serverMetadata"]
+
+        self.assertEqual(
+            server_metadata["workspaces"],
+            [{"id": "미지정 워크스페이스", "name": "미지정 워크스페이스"}],
+        )
+        self.assertEqual(server_metadata["notes"][0]["folder"], "미지정 워크스페이스")
+        self.assertEqual(server_metadata["notes"][0]["workspace"], "미지정 워크스페이스")
+
     def test_attachment_upload_uses_readable_note_storage_path(self):
         content = b"\x89PNG\r\nreadable-attachment"
         digest = hashlib.sha256(content).hexdigest()
@@ -630,6 +739,98 @@ class SyncApiTest(unittest.TestCase):
             plan["downloadAttachments"][0]["relativePath"],
             attachment["relativePath"],
         )
+
+    def test_fresh_client_metadata_divergence_does_not_create_synthetic_conflict(self):
+        metadata = self.note_metadata()
+        upload = self.client.post(
+            "/api/sync/file",
+            headers=self.headers,
+            json={
+                "clientId": "existing-client",
+                "baseRevision": 0,
+                "relativePath": "memo/note.md",
+                "lastKnownRevision": 0,
+                "updatedAtMs": 10,
+                "contentEncoding": "utf-8",
+                "content": "# existing server note\n",
+                "workspace": {"id": "memo", "name": "memo"},
+                "note": metadata["notes"][0],
+            },
+        )
+        self.assertEqual(upload.status_code, 200)
+
+        plan_response = self.client.post(
+            "/api/sync/plan",
+            headers=self.headers,
+            json={
+                "clientId": "fresh-windows-client",
+                "baseRevision": 0,
+                "metadata": {
+                    "lastKnownRevision": 0,
+                    "body": {
+                        "version": 1,
+                        "generatedAt": "2026-07-16T00:00:00.000Z",
+                        "workspaces": [],
+                        "notes": [],
+                    },
+                },
+                "knownFiles": [],
+                "knownAttachments": [],
+            },
+        )
+
+        self.assertEqual(plan_response.status_code, 200)
+        payload = plan_response.get_json()
+        self.assertEqual(payload["metadata"]["status"], "diverged")
+        self.assertEqual(payload["status"], "ok")
+        self.assertEqual(payload["plan"]["conflicts"], [])
+        self.assertEqual(
+            payload["plan"]["downloadFiles"][0]["relativePath"],
+            "memo/note.md",
+        )
+
+    def test_fresh_client_same_path_becomes_file_conflict(self):
+        server_metadata = self.note_metadata(updated_at_ms=10)
+        upload = self.client.post(
+            "/api/sync/file",
+            headers=self.headers,
+            json={
+                "clientId": "existing-client",
+                "baseRevision": 0,
+                "relativePath": "memo/note.md",
+                "lastKnownRevision": 0,
+                "updatedAtMs": 10,
+                "contentEncoding": "utf-8",
+                "content": "# server content\n",
+                "workspace": {"id": "memo", "name": "memo"},
+                "note": server_metadata["notes"][0],
+            },
+        )
+        self.assertEqual(upload.status_code, 200)
+
+        local_metadata = self.note_metadata(updated_at_ms=20)
+        plan_response = self.client.post(
+            "/api/sync/plan",
+            headers=self.headers,
+            json={
+                "clientId": "fresh-client-with-local-note",
+                "baseRevision": 0,
+                "metadata": {
+                    "lastKnownRevision": 0,
+                    "body": local_metadata,
+                },
+                "knownFiles": [],
+                "knownAttachments": [],
+            },
+        )
+
+        self.assertEqual(plan_response.status_code, 200)
+        payload = plan_response.get_json()
+        self.assertEqual(payload["status"], "conflict")
+        self.assertEqual(len(payload["plan"]["conflicts"]), 1)
+        conflict = payload["plan"]["conflicts"][0]
+        self.assertEqual(conflict["relativePath"], "memo/note.md")
+        self.assertEqual(conflict["reason"], "same_path_without_sync_history")
 
     def test_plan_server_delete_requires_explicit_known_tombstone(self):
         metadata = self.note_metadata()

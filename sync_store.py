@@ -582,18 +582,6 @@ class SyncStore:
             )
 
             conflicts = plan["conflicts"]
-            if metadata["status"] == "diverged":
-                conflicts = [
-                    {
-                        "type": "metadata",
-                        "relativePath": "metadata",
-                        "reason": "server_metadata_changed_after_client_base",
-                        "serverRevision": metadata["serverRevision"],
-                        "clientRevision": metadata_revision,
-                    },
-                    *conflicts,
-                ]
-                plan["conflicts"] = conflicts
 
             self._record_client(
                 state,
@@ -1587,7 +1575,9 @@ class SyncStore:
             return None
 
         metadata = self._read_metadata_body() or self._empty_metadata()
-        changed = False
+        normalized_metadata = self._normalize_metadata_body(metadata)
+        changed = normalized_metadata != metadata
+        metadata = normalized_metadata
 
         if deleted:
             deleted_note = self._note_for_update(
@@ -1598,7 +1588,7 @@ class SyncStore:
             record = state["files"].get(relative_path)
             if deleted_note and isinstance(record, dict):
                 record["deletedNote"] = dict(deleted_note)
-            changed = self._remove_note(metadata, relative_path)
+            changed = self._remove_note(metadata, relative_path) or changed
         else:
             if workspace:
                 changed = self._upsert_workspace(metadata, workspace) or changed
@@ -1627,6 +1617,7 @@ class SyncStore:
                 "contentHash": state["metadata"].get("contentHash"),
             }
 
+        metadata = self._normalize_metadata_body(metadata)
         metadata["generatedAt"] = now
         content_hash = sha256_json(metadata)
         state["serverRevision"] += 1
@@ -1675,7 +1666,9 @@ class SyncStore:
         note_relative_path = normalize_relative_path(note_relative_path)
 
         metadata = self._read_metadata_body() or self._empty_metadata()
-        changed = False
+        normalized_metadata = self._normalize_metadata_body(metadata)
+        changed = normalized_metadata != metadata
+        metadata = normalized_metadata
 
         if workspace:
             changed = self._upsert_workspace(metadata, workspace) or changed
@@ -1739,6 +1732,7 @@ class SyncStore:
                 "contentHash": state["metadata"].get("contentHash"),
             }
 
+        metadata = self._normalize_metadata_body(metadata)
         metadata["generatedAt"] = now
         content_hash = sha256_json(metadata)
         state["serverRevision"] += 1
@@ -1772,15 +1766,21 @@ class SyncStore:
         restored_content=None,
     ):
         metadata = self._read_metadata_body() or self._empty_metadata()
+        normalized_metadata = self._normalize_metadata_body(metadata)
+        changed = normalized_metadata != metadata
+        metadata = normalized_metadata
         if deleted:
-            changed = self._remove_note(metadata, relative_path)
+            changed = self._remove_note(metadata, relative_path) or changed
         else:
-            changed = self._restore_note_metadata(
-                metadata,
-                relative_path,
-                updated_at_ms,
-                note_snapshot=note_snapshot,
-                restored_content=restored_content,
+            changed = (
+                self._restore_note_metadata(
+                    metadata,
+                    relative_path,
+                    updated_at_ms,
+                    note_snapshot=note_snapshot,
+                    restored_content=restored_content,
+                )
+                or changed
             )
             self._store_note_metadata_snapshot(state, relative_path, metadata)
 
@@ -1791,6 +1791,7 @@ class SyncStore:
                 "contentHash": state["metadata"].get("contentHash"),
             }
 
+        metadata = self._normalize_metadata_body(metadata)
         metadata["generatedAt"] = now
         content_hash = sha256_json(metadata)
         state["serverRevision"] += 1
@@ -1842,7 +1843,9 @@ class SyncStore:
         note_relative_path = normalize_relative_path(note_relative_path)
 
         metadata = self._read_metadata_body() or self._empty_metadata()
-        changed = False
+        normalized_metadata = self._normalize_metadata_body(metadata)
+        changed = normalized_metadata != metadata
+        metadata = normalized_metadata
         current_note = self._note_for_update(
             metadata,
             note_relative_path,
@@ -1889,6 +1892,7 @@ class SyncStore:
                 "contentHash": state["metadata"].get("contentHash"),
             }
 
+        metadata = self._normalize_metadata_body(metadata)
         metadata["generatedAt"] = now
         content_hash = sha256_json(metadata)
         state["serverRevision"] += 1
@@ -2063,12 +2067,14 @@ class SyncStore:
             metadata_payload.get("lastKnownRevision", base_revision),
             "metadata.lastKnownRevision",
         )
-        content_hash = metadata_payload.get("contentHash") or sha256_json(body)
+        raw_hash = sha256_json(body)
+        body = self._normalize_metadata_body(body)
         computed_hash = sha256_json(body)
-        if content_hash != computed_hash:
+        content_hash = metadata_payload.get("contentHash")
+        if content_hash and content_hash not in (raw_hash, computed_hash):
             raise SyncError("metadata.contentHash does not match metadata body.")
 
-        return body, content_hash, last_known_revision
+        return body, computed_hash, last_known_revision
 
     def _known_files_by_path(self, known_files, base_revision, field_name):
         if known_files is None:
@@ -2296,6 +2302,22 @@ class SyncStore:
                         )
                     )
                 continue
+
+            if record and server_revision > 0 and last_known_revision <= 0:
+                known_hash = known.get("contentHash")
+                if not known_hash or record.get("contentHash") != known_hash:
+                    plan["conflicts"].append(
+                        self._conflict_plan_item(
+                            relative_path,
+                            "same_path_without_sync_history",
+                            client_note,
+                            server_note,
+                            record,
+                            client_workspaces,
+                            server_workspaces,
+                        )
+                    )
+                    continue
 
             if client_updated is not None and server_updated is not None:
                 if client_updated > server_updated:
@@ -2579,6 +2601,18 @@ class SyncStore:
             if record and client_hash and record.get("contentHash") == client_hash:
                 continue
 
+            if record and server_revision > 0 and last_known_revision <= 0:
+                plan["conflicts"].append(
+                    self._attachment_conflict_plan_item(
+                        relative_path,
+                        "same_path_without_sync_history",
+                        client_entry,
+                        server_entry,
+                        record,
+                    )
+                )
+                continue
+
             server_changed = (
                 record
                 and server_revision > last_known_revision
@@ -2762,7 +2796,12 @@ class SyncStore:
         if not note:
             return None
         workspace_id = note.get("workspace")
-        return workspaces.get(workspace_id) if workspace_id else None
+        if not workspace_id:
+            return None
+        return workspaces.get(workspace_id) or {
+            "id": workspace_id,
+            "name": note.get("workspaceName") or workspace_id,
+        }
 
     def _note_updated_ms(self, note):
         if not note:
@@ -2958,6 +2997,165 @@ class SyncStore:
             "notes": [],
         }
 
+    def _workspace_names(self, metadata):
+        workspaces = metadata.get("workspaces", []) if isinstance(metadata, dict) else []
+        if not isinstance(workspaces, list):
+            raise SyncError("metadata.workspaces must be a list.")
+
+        names = {}
+        for workspace in workspaces:
+            if not isinstance(workspace, dict):
+                raise SyncError("Each metadata workspace must be an object.")
+            workspace_id = workspace.get("id")
+            if workspace_id:
+                names[workspace_id] = workspace.get("name") or workspace_id
+        return names
+
+    def _metadata_folder_from_relative_path(self, relative_path):
+        parent = str(PurePosixPath(relative_path).parent)
+        return "" if parent == "." else parent
+
+    def _metadata_workspace_label(
+        self,
+        note,
+        canonical_workspace_id,
+        workspace_names,
+        previous_folder=None,
+        previous_workspace=None,
+    ):
+        existing_label = note.get("workspaceName")
+        if workspace_names.get(canonical_workspace_id):
+            return workspace_names[canonical_workspace_id]
+
+        previous_values = {
+            str(value)
+            for value in (
+                previous_folder,
+                previous_workspace,
+                "unfiled",
+                "_imported",
+            )
+            if value
+        }
+        if existing_label and str(existing_label) not in previous_values:
+            return existing_label
+
+        for previous_id in (previous_workspace, previous_folder):
+            previous_label = workspace_names.get(previous_id)
+            if previous_label and str(previous_label) not in previous_values:
+                return previous_label
+
+        return canonical_workspace_id
+
+    def _normalize_metadata_note(
+        self,
+        note,
+        relative_path=None,
+        workspace_names=None,
+    ):
+        if not isinstance(note, dict):
+            raise SyncError("Each metadata note must be an object.")
+
+        normalized = dict(note)
+        relative_path = normalize_relative_path(
+            relative_path or normalized.get("relativePath")
+        )
+        normalized["relativePath"] = relative_path
+        workspace_names = workspace_names or {}
+
+        folder = self._metadata_folder_from_relative_path(relative_path)
+        if folder:
+            previous_folder = normalized.get("folder")
+            previous_workspace = normalized.get("workspace")
+            normalized["folder"] = folder
+            normalized["workspace"] = folder
+            normalized["workspaceName"] = self._metadata_workspace_label(
+                normalized,
+                folder,
+                workspace_names,
+                previous_folder=previous_folder,
+                previous_workspace=previous_workspace,
+            )
+        elif not normalized.get("folder") and not normalized.get("workspace"):
+            normalized["folder"] = "unfiled"
+            normalized["workspace"] = "unfiled"
+            normalized["workspaceName"] = (
+                workspace_names.get("unfiled") or "미지정 워크스페이스"
+            )
+
+        return normalized
+
+    def _normalize_metadata_body(self, body):
+        if not isinstance(body, dict):
+            raise SyncError("metadata body must be an object.")
+
+        normalized = copy.deepcopy(body)
+        workspaces = normalized.get("workspaces", [])
+        notes = normalized.get("notes", [])
+        if not isinstance(workspaces, list):
+            raise SyncError("metadata.workspaces must be a list.")
+        if not isinstance(notes, list):
+            raise SyncError("metadata.notes must be a list.")
+
+        workspace_names = self._workspace_names(normalized)
+        next_notes = []
+        referenced_workspaces = {}
+        for note in notes:
+            if not isinstance(note, dict):
+                raise SyncError("Each metadata note must be an object.")
+            if not note.get("relativePath"):
+                next_notes.append(note)
+                continue
+
+            normalized_note = self._normalize_metadata_note(
+                note,
+                workspace_names=workspace_names,
+            )
+            next_notes.append(normalized_note)
+            workspace_id = normalized_note.get("workspace")
+            if workspace_id:
+                referenced_workspaces[workspace_id] = (
+                    normalized_note.get("workspaceName") or workspace_id
+                )
+        normalized["notes"] = next_notes
+
+        referenced_names = {
+            name for name in referenced_workspaces.values() if name
+        }
+        next_workspaces = []
+        seen_workspace_ids = set()
+        for workspace in workspaces:
+            if not isinstance(workspace, dict):
+                raise SyncError("Each metadata workspace must be an object.")
+            workspace_id = workspace.get("id")
+            if not workspace_id:
+                continue
+
+            workspace_name = workspace.get("name") or workspace_id
+            if (
+                workspace_id not in referenced_workspaces
+                and workspace_name in referenced_names
+            ):
+                continue
+
+            next_workspace = dict(workspace)
+            if workspace_id in referenced_workspaces:
+                next_workspace["name"] = referenced_workspaces[workspace_id]
+            next_workspaces.append(next_workspace)
+            seen_workspace_ids.add(workspace_id)
+
+        for workspace_id, workspace_name in referenced_workspaces.items():
+            if workspace_id not in seen_workspace_ids:
+                next_workspaces.append(
+                    {
+                        "id": workspace_id,
+                        "name": workspace_name or workspace_id,
+                    }
+                )
+
+        normalized["workspaces"] = next_workspaces
+        return normalized
+
     def _upsert_workspace(self, metadata, workspace):
         workspace_id = workspace.get("id")
         if not workspace_id:
@@ -2975,6 +3173,10 @@ class SyncStore:
         return True
 
     def _upsert_note(self, metadata, note):
+        note = self._normalize_metadata_note(
+            note,
+            workspace_names=self._workspace_names(metadata),
+        )
         relative_path = normalize_relative_path(note.get("relativePath"))
         notes = metadata.setdefault("notes", [])
         for index, current in enumerate(notes):
@@ -2997,11 +3199,14 @@ class SyncStore:
                 return False
 
         notes.append(
-            {
-                "relativePath": relative_path,
-                "fileName": PurePosixPath(relative_path).name,
-                "attachments": [],
-            }
+            self._normalize_metadata_note(
+                {
+                    "relativePath": relative_path,
+                    "fileName": PurePosixPath(relative_path).name,
+                    "attachments": [],
+                },
+                workspace_names=self._workspace_names(metadata),
+            )
         )
         return True
 
@@ -3642,6 +3847,7 @@ class SyncStore:
     def _replace_metadata_body(self, connection, body):
         if not isinstance(body, dict):
             raise SyncError("metadata body must be an object.")
+        body = self._normalize_metadata_body(body)
 
         workspaces = body.get("workspaces", [])
         notes = body.get("notes", [])
@@ -3783,6 +3989,7 @@ class SyncStore:
 
     def _write_metadata_body(self, body):
         self._ensure_metadata_store()
+        body = self._normalize_metadata_body(body)
         with self._metadata_connection() as connection:
             self._replace_metadata_body(connection, body)
 
@@ -3840,6 +4047,20 @@ class SyncStore:
                 return self._metadata_notes_by_path(next_connection)
 
         notes = {}
+        workspace_names = {
+            workspace.get("id"): workspace.get("name") or workspace.get("id")
+            for workspace in (
+                json.loads(row["body_json"])
+                for row in connection.execute(
+                    """
+                    SELECT body_json
+                    FROM metadata_workspaces
+                    ORDER BY position, id
+                    """
+                )
+            )
+            if isinstance(workspace, dict) and workspace.get("id")
+        }
         for row in connection.execute(
             """
             SELECT relative_path, body_json
@@ -3848,7 +4069,11 @@ class SyncStore:
             """
         ):
             note = json.loads(row["body_json"])
-            note["relativePath"] = row["relative_path"]
+            note = self._normalize_metadata_note(
+                note,
+                relative_path=row["relative_path"],
+                workspace_names=workspace_names,
+            )
             notes[row["relative_path"]] = note
         return notes
 
@@ -3910,7 +4135,7 @@ class SyncStore:
                     note["attachments"] = attachments
                 notes.append(note)
             body["notes"] = notes
-            return body
+            return self._normalize_metadata_body(body)
 
     def _decode_content(self, item, relative_path):
         if "content" not in item:
