@@ -3,7 +3,7 @@ def build_openapi_spec(server_url):
         "openapi": "3.1.0",
         "info": {
             "title": "Notedown Sync Server API",
-            "version": "1.0.0",
+            "version": "1.0.1",
             "description": (
                 "Markdown note metadata and file synchronization API with "
                 "revision-based conflict detection."
@@ -1432,7 +1432,10 @@ def build_openapi_spec(server_url):
                         },
                         "note": {
                             "type": "object",
-                            "description": "Note metadata object to upsert by relativePath or id.",
+                            "description": (
+                                "Note metadata object for the exact relativePath. "
+                                "Existing note id-to-relativePath mappings cannot be reassigned."
+                            ),
                             "additionalProperties": True,
                         },
                     },

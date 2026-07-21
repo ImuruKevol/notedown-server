@@ -1,11 +1,13 @@
 import base64
 import hashlib
+import json
+import os
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from app import create_app
-from sync_store import sha256_json
+from sync_store import atomic_write_bytes, sha256_json
 
 
 class SyncApiTest(unittest.TestCase):
@@ -1016,7 +1018,11 @@ class SyncApiTest(unittest.TestCase):
             },
         ).get_json()
 
-        self.assertEqual(metadata_only["attachment"]["status"], "unchanged")
+        self.assertEqual(metadata_only["attachment"]["status"], "accepted")
+        self.assertEqual(
+            metadata_only["attachment"]["storagePath"],
+            "memo/attachments/새 노트/diagram.png",
+        )
         self.assertEqual(metadata_only["metadata"]["status"], "accepted")
         self.assertEqual(
             metadata_only["manifest"]["attachments"][0]["contentHash"],
@@ -2119,6 +2125,568 @@ class SyncApiTest(unittest.TestCase):
         )
 
         self.assertEqual(response.status_code, 400)
+
+    def test_rejects_mismatched_nested_note_path_before_file_write(self):
+        response = self.client.post(
+            "/api/sync/file",
+            headers=self.headers,
+            json={
+                "clientId": "client-a",
+                "relativePath": "memo/new.md",
+                "lastKnownRevision": 0,
+                "contentEncoding": "utf-8",
+                "content": "new content",
+                "note": {
+                    "id": "note-new",
+                    "title": "New",
+                    "relativePath": "memo/old.md",
+                },
+            },
+        )
+
+        self.assertEqual(response.status_code, 400)
+        manifest = self.client.get("/api/manifest", headers=self.headers).get_json()
+        self.assertEqual(manifest["files"], [])
+        stored_files = [
+            path
+            for path in (Path(self.tempdir.name) / "files").rglob("*")
+            if path.is_file() and ".git" not in path.parts
+        ]
+        self.assertEqual(stored_files, [])
+
+    def test_rejects_note_id_path_reassignment_without_overwriting(self):
+        metadata = self.note_metadata()
+        first = self.client.post(
+            "/api/sync/file",
+            headers=self.headers,
+            json={
+                "clientId": "client-a",
+                "relativePath": "memo/note.md",
+                "lastKnownRevision": 0,
+                "contentEncoding": "utf-8",
+                "content": "original",
+                "note": metadata["notes"][0],
+            },
+        ).get_json()
+
+        different_id = dict(metadata["notes"][0], id="note-2", title="Other")
+        response = self.client.post(
+            "/api/sync/file",
+            headers=self.headers,
+            json={
+                "clientId": "client-a",
+                "relativePath": "memo/note.md",
+                "lastKnownRevision": first["file"]["revision"],
+                "contentEncoding": "utf-8",
+                "content": "replacement",
+                "note": different_id,
+            },
+        )
+        self.assertEqual(response.status_code, 400)
+
+        moved_note = dict(
+            metadata["notes"][0],
+            relativePath="memo/other.md",
+            title="Moved",
+        )
+        response = self.client.post(
+            "/api/sync/file",
+            headers=self.headers,
+            json={
+                "clientId": "client-a",
+                "relativePath": "memo/other.md",
+                "lastKnownRevision": 0,
+                "contentEncoding": "utf-8",
+                "content": "moved",
+                "note": moved_note,
+            },
+        )
+        self.assertEqual(response.status_code, 400)
+        current = self.client.get(
+            "/api/files/memo/note.md",
+            headers=self.headers,
+        ).get_json()
+        self.assertEqual(self.decoded_content(current), "original")
+
+    def test_rejects_duplicate_metadata_id_and_path_before_batch_write(self):
+        metadata = self.note_metadata()
+        duplicate = dict(metadata["notes"][0], id="note-2")
+        metadata["notes"].append(duplicate)
+        response = self.client.post(
+            "/api/sync",
+            headers=self.headers,
+            json={
+                "clientId": "client-a",
+                "metadata": {"lastKnownRevision": 0, "body": metadata},
+                "files": [
+                    {
+                        "relativePath": "memo/note.md",
+                        "lastKnownRevision": 0,
+                        "contentEncoding": "utf-8",
+                        "content": "must not be written",
+                    }
+                ],
+            },
+        )
+        self.assertEqual(response.status_code, 400)
+        manifest = self.client.get("/api/manifest", headers=self.headers).get_json()
+        self.assertEqual(manifest["serverRevision"], 0)
+        self.assertEqual(manifest["files"], [])
+
+        metadata = self.note_metadata()
+        second = dict(
+            metadata["notes"][0],
+            relativePath="memo/second.md",
+        )
+        metadata["notes"].append(second)
+        response = self.client.post(
+            "/api/sync",
+            headers=self.headers,
+            json={
+                "clientId": "client-a",
+                "metadata": {"lastKnownRevision": 0, "body": metadata},
+            },
+        )
+        self.assertEqual(response.status_code, 400)
+
+    def test_same_content_rename_moves_storage_and_stale_retry_cannot_revert(self):
+        metadata = self.note_metadata()
+        metadata["notes"][0].update(
+            {"title": "Old", "fileName": "Old.md", "storagePath": "memo/Old.md"}
+        )
+        first = self.client.post(
+            "/api/sync/file",
+            headers=self.headers,
+            json={
+                "clientId": "client-a",
+                "relativePath": "memo/note.md",
+                "lastKnownRevision": 0,
+                "contentEncoding": "utf-8",
+                "content": "same body",
+                "note": metadata["notes"][0],
+            },
+        ).get_json()
+
+        renamed_note = dict(
+            metadata["notes"][0],
+            title="Renamed",
+            fileName="Renamed.md",
+            storagePath="memo/Renamed.md",
+            updatedAtMs=20,
+        )
+        renamed = self.client.post(
+            "/api/sync/file",
+            headers=self.headers,
+            json={
+                "clientId": "client-a",
+                "relativePath": "memo/note.md",
+                "lastKnownRevision": first["file"]["revision"],
+                "updatedAtMs": 20,
+                "contentEncoding": "utf-8",
+                "content": "same body",
+                "note": renamed_note,
+            },
+        ).get_json()
+        self.assertEqual(renamed["file"]["status"], "accepted")
+        self.assertEqual(renamed["file"]["storagePath"], "memo/Renamed.md")
+        self.assertEqual(renamed["file"]["revision"], renamed["serverRevision"])
+        self.assertEqual(
+            renamed["manifest"]["files"][0]["note"]["fileName"],
+            "Renamed.md",
+        )
+        self.assertFalse((Path(self.tempdir.name) / "files/memo/Old.md").exists())
+        self.assertTrue((Path(self.tempdir.name) / "files/memo/Renamed.md").exists())
+
+        retry = self.client.post(
+            "/api/sync/file",
+            headers=self.headers,
+            json={
+                "clientId": "client-a",
+                "relativePath": "memo/note.md",
+                "lastKnownRevision": first["file"]["revision"],
+                "updatedAtMs": 20,
+                "contentEncoding": "utf-8",
+                "content": "same body",
+                "note": renamed_note,
+            },
+        ).get_json()
+        self.assertEqual(retry["file"]["status"], "unchanged")
+
+        stale = self.client.post(
+            "/api/sync/file",
+            headers=self.headers,
+            json={
+                "clientId": "client-a",
+                "relativePath": "memo/note.md",
+                "lastKnownRevision": first["file"]["revision"],
+                "contentEncoding": "utf-8",
+                "content": "same body",
+                "note": metadata["notes"][0],
+            },
+        ).get_json()
+        self.assertEqual(stale["status"], "conflict")
+        self.assertTrue((Path(self.tempdir.name) / "files/memo/Renamed.md").exists())
+
+    def test_same_content_rename_avoids_orphan_physical_target(self):
+        metadata = self.note_metadata()
+        metadata["notes"][0].update(
+            {"title": "Old", "fileName": "Old.md", "storagePath": "memo/Old.md"}
+        )
+        first = self.client.post(
+            "/api/sync/file",
+            headers=self.headers,
+            json={
+                "clientId": "client-a",
+                "relativePath": "memo/note.md",
+                "lastKnownRevision": 0,
+                "contentEncoding": "utf-8",
+                "content": "same body",
+                "note": metadata["notes"][0],
+            },
+        ).get_json()
+
+        orphan_path = Path(self.tempdir.name) / "files/memo/Renamed.md"
+        orphan_path.write_text("orphan content", encoding="utf-8")
+        renamed_note = dict(
+            metadata["notes"][0],
+            title="Renamed",
+            fileName="Renamed.md",
+            storagePath="memo/Renamed.md",
+        )
+        response = self.client.post(
+            "/api/sync/file",
+            headers=self.headers,
+            json={
+                "clientId": "client-a",
+                "relativePath": "memo/note.md",
+                "lastKnownRevision": first["file"]["revision"],
+                "contentEncoding": "utf-8",
+                "content": "same body",
+                "note": renamed_note,
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        renamed = response.get_json()["file"]
+        self.assertEqual(renamed["status"], "accepted")
+        self.assertNotEqual(renamed["storagePath"], "memo/Renamed.md")
+        self.assertTrue(
+            (Path(self.tempdir.name) / "files" / renamed["storagePath"]).exists()
+        )
+        self.assertEqual(orphan_path.read_text(encoding="utf-8"), "orphan content")
+
+    def test_full_metadata_preserves_existing_note_and_attachment_identities(self):
+        content = b"attachment"
+        metadata = self.note_metadata()
+        metadata["notes"][0]["attachments"] = [self.attachment_metadata(content)]
+        first = self.client.post(
+            "/api/sync/file",
+            headers=self.headers,
+            json={
+                "clientId": "client-a",
+                "relativePath": "memo/note.md",
+                "lastKnownRevision": 0,
+                "contentEncoding": "utf-8",
+                "content": "body",
+                "note": metadata["notes"][0],
+            },
+        ).get_json()
+        metadata_revision = first["manifest"]["metadata"]["revision"]
+
+        missing_note_id = self.note_metadata()
+        missing_note_id["notes"][0].pop("id")
+        response = self.client.post(
+            "/api/sync",
+            headers=self.headers,
+            json={
+                "clientId": "client-a",
+                "metadata": {
+                    "lastKnownRevision": metadata_revision,
+                    "body": missing_note_id,
+                },
+            },
+        )
+        self.assertEqual(response.status_code, 400)
+
+        remapped_attachment = self.note_metadata()
+        attachment = self.attachment_metadata(content)
+        attachment["id"] = "att-2"
+        remapped_attachment["notes"][0]["attachments"] = [attachment]
+        response = self.client.post(
+            "/api/sync",
+            headers=self.headers,
+            json={
+                "clientId": "client-a",
+                "metadata": {
+                    "lastKnownRevision": metadata_revision,
+                    "body": remapped_attachment,
+                },
+            },
+        )
+        self.assertEqual(response.status_code, 400)
+
+    def test_full_metadata_requires_matching_delete_for_active_attachment(self):
+        content = b"active attachment"
+        digest = hashlib.sha256(content).hexdigest()
+        metadata = self.note_metadata()
+        attachment = self.attachment_metadata(content)
+        metadata["notes"][0]["attachments"] = [attachment]
+        upload = self.client.post(
+            "/api/sync/attachment",
+            headers=self.headers,
+            json={
+                "clientId": "client-a",
+                "noteRelativePath": "memo/note.md",
+                "relativePath": attachment["relativePath"],
+                "lastKnownRevision": 0,
+                "contentEncoding": "base64",
+                "content": base64.b64encode(content).decode("ascii"),
+                "contentHash": digest,
+                "note": metadata["notes"][0],
+                "attachment": attachment,
+            },
+        ).get_json()
+
+        without_attachment = self.note_metadata()
+        without_attachment["notes"][0]["attachments"] = []
+        rejected = self.client.post(
+            "/api/sync",
+            headers=self.headers,
+            json={
+                "clientId": "client-a",
+                "metadata": {
+                    "lastKnownRevision": upload["manifest"]["metadata"]["revision"],
+                    "body": without_attachment,
+                },
+            },
+        ).get_json()
+        self.assertEqual(rejected["status"], "conflict")
+        self.assertEqual(
+            rejected["metadata"]["reason"],
+            "metadata_removes_existing_server_attachments",
+        )
+
+        deleted = self.client.post(
+            "/api/sync",
+            headers=self.headers,
+            json={
+                "clientId": "client-a",
+                "metadata": {
+                    "lastKnownRevision": upload["manifest"]["metadata"]["revision"],
+                    "body": without_attachment,
+                },
+                "attachments": [
+                    {
+                        "relativePath": attachment["relativePath"],
+                        "lastKnownRevision": upload["attachment"]["revision"],
+                        "deleted": True,
+                    }
+                ],
+            },
+        ).get_json()
+        self.assertEqual(deleted["status"], "ok")
+        self.assertEqual(deleted["metadata"]["status"], "accepted")
+        self.assertTrue(deleted["acceptedAttachments"][0]["deleted"])
+
+        state_only_path = "memo/.attachments/note-1/state-only.bin"
+        state_only = self.client.post(
+            "/api/sync",
+            headers=self.headers,
+            json={
+                "clientId": "client-a",
+                "attachments": [
+                    {
+                        "relativePath": state_only_path,
+                        "noteRelativePath": "memo/note.md",
+                        "lastKnownRevision": 0,
+                        "contentEncoding": "base64",
+                        "content": base64.b64encode(b"state only").decode("ascii"),
+                        "attachment": {"id": "att-state"},
+                    }
+                ],
+            },
+        ).get_json()
+        state_only_removal = self.client.post(
+            "/api/sync",
+            headers=self.headers,
+            json={
+                "clientId": "client-a",
+                "metadata": {
+                    "lastKnownRevision": state_only["manifest"]["metadata"]["revision"],
+                    "body": without_attachment,
+                },
+            },
+        ).get_json()
+        self.assertEqual(state_only_removal["status"], "conflict")
+        self.assertEqual(
+            state_only_removal["metadata"]["reason"],
+            "metadata_removes_existing_server_attachments",
+        )
+        remapped = self.note_metadata()
+        remapped["notes"][0]["attachments"] = [
+            {"id": "att-remapped", "relativePath": state_only_path}
+        ]
+        response = self.client.post(
+            "/api/sync",
+            headers=self.headers,
+            json={
+                "clientId": "client-a",
+                "metadata": {
+                    "lastKnownRevision": state_only["manifest"]["metadata"]["revision"],
+                    "body": remapped,
+                },
+            },
+        )
+        self.assertEqual(response.status_code, 400)
+
+    def test_attachment_metadata_only_retry_stale_guard_and_canonical_storage(self):
+        content = b"attachment metadata"
+        digest = hashlib.sha256(content).hexdigest()
+        metadata = self.note_metadata()
+        attachment = self.attachment_metadata(content)
+        metadata["notes"][0]["attachments"] = [attachment]
+        orphan_path = (
+            Path(self.tempdir.name)
+            / "files/memo/attachments/새 노트/diagram.png"
+        )
+        orphan_path.parent.mkdir(parents=True)
+        orphan_path.write_bytes(b"orphan")
+
+        upload = self.client.post(
+            "/api/sync/attachment",
+            headers=self.headers,
+            json={
+                "clientId": "client-a",
+                "noteRelativePath": "memo/note.md",
+                "relativePath": attachment["relativePath"],
+                "lastKnownRevision": 0,
+                "contentEncoding": "base64",
+                "content": base64.b64encode(content).decode("ascii"),
+                "contentHash": digest,
+                "note": metadata["notes"][0],
+                "attachment": attachment,
+            },
+        ).get_json()
+        storage_path = upload["attachment"]["storagePath"]
+        self.assertNotEqual(storage_path, "memo/attachments/새 노트/diagram.png")
+
+        updated_attachment = dict(
+            attachment,
+            mimeType="application/octet-stream",
+            tags=["synced"],
+            status="reviewed",
+        )
+        update_payload = {
+            "clientId": "client-a",
+            "noteRelativePath": "memo/note.md",
+            "relativePath": attachment["relativePath"],
+            "lastKnownRevision": upload["attachment"]["revision"],
+            "contentHash": digest,
+            "attachment": updated_attachment,
+        }
+        updated = self.client.post(
+            "/api/sync/attachment",
+            headers=self.headers,
+            json=update_payload,
+        ).get_json()
+        self.assertEqual(updated["metadata"]["status"], "accepted")
+        self.assertEqual(updated["attachment"]["revision"], updated["serverRevision"])
+
+        retry = self.client.post(
+            "/api/sync/attachment",
+            headers=self.headers,
+            json=update_payload,
+        ).get_json()
+        self.assertEqual(retry["status"], "ok")
+        self.assertEqual(retry["metadata"]["status"], "unchanged")
+
+        stale_attachment = dict(attachment, tags=["stale"], status="draft")
+        stale = self.client.post(
+            "/api/sync/attachment",
+            headers=self.headers,
+            json={**update_payload, "attachment": stale_attachment},
+        ).get_json()
+        self.assertEqual(stale["status"], "conflict")
+
+        state = json.loads(
+            (Path(self.tempdir.name) / "state.json").read_text(encoding="utf-8")
+        )
+        record = state["files"][attachment["relativePath"]]
+        self.assertEqual(record["revision"], updated["serverRevision"])
+        self.assertEqual(record["attachmentSnapshot"]["tags"], ["synced"])
+        self.assertEqual(record["attachmentSnapshot"]["status"], "reviewed")
+        self.assertEqual(record["attachmentSnapshot"]["storagePath"], storage_path)
+        self.assertEqual(
+            record["attachmentSnapshot"]["fileName"],
+            Path(storage_path).name,
+        )
+        self.assertEqual(orphan_path.read_bytes(), b"orphan")
+
+    def test_attachment_requires_note_path_before_single_or_batch_write(self):
+        for endpoint, relative_path in (
+            ("/api/sync/attachment", "a.bin"),
+            ("/api/sync", "b.bin"),
+        ):
+            item = {
+                "relativePath": relative_path,
+                "lastKnownRevision": 0,
+                "contentEncoding": "base64",
+                "content": base64.b64encode(b"orphan").decode("ascii"),
+            }
+            body = {"clientId": "client-a", **item}
+            if endpoint == "/api/sync":
+                body = {"clientId": "client-a", "attachments": [item]}
+            response = self.client.post(endpoint, headers=self.headers, json=body)
+            self.assertEqual(response.status_code, 400)
+
+        manifest = self.client.get("/api/manifest", headers=self.headers).get_json()
+        self.assertEqual(manifest["serverRevision"], 0)
+        self.assertEqual(manifest["attachments"], [])
+        self.assertFalse((Path(self.tempdir.name) / "files/a.bin").exists())
+        self.assertFalse((Path(self.tempdir.name) / "files/b.bin").exists())
+
+    def test_atomic_write_keeps_secure_new_mode_and_preserves_existing_mode(self):
+        path = Path(self.tempdir.name) / "private.json"
+        previous_umask = os.umask(0o077)
+        try:
+            atomic_write_bytes(path, b"first")
+        finally:
+            os.umask(previous_umask)
+        self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+
+        path.chmod(0o640)
+        atomic_write_bytes(path, b"second")
+        self.assertEqual(path.stat().st_mode & 0o777, 0o640)
+        self.assertEqual(path.read_bytes(), b"second")
+
+    def test_batch_validation_prevents_partial_metadata_and_file_writes(self):
+        metadata = self.note_metadata()
+        response = self.client.post(
+            "/api/sync",
+            headers=self.headers,
+            json={
+                "clientId": "client-a",
+                "metadata": {"lastKnownRevision": 0, "body": metadata},
+                "files": [
+                    {
+                        "relativePath": "memo/note.md",
+                        "lastKnownRevision": 0,
+                        "contentEncoding": "utf-8",
+                        "content": "valid first",
+                    },
+                    {
+                        "relativePath": "memo/invalid.md",
+                        "lastKnownRevision": 0,
+                        "contentEncoding": "utf-8",
+                    },
+                ],
+            },
+        )
+        self.assertEqual(response.status_code, 400)
+        manifest = self.client.get("/api/manifest", headers=self.headers).get_json()
+        self.assertEqual(manifest["serverRevision"], 0)
+        self.assertEqual(manifest["metadata"]["revision"], 0)
+        self.assertEqual(manifest["files"], [])
 
     def test_openapi_document_and_swagger_ui_are_public(self):
         spec_response = self.client.get("/api/openapi.json")

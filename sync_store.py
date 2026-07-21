@@ -1,6 +1,7 @@
 import base64
 import binascii
 import copy
+import errno
 import hashlib
 import json
 import os
@@ -8,11 +9,17 @@ import re
 import shutil
 import sqlite3
 import subprocess
+import tempfile
 import threading
 import unicodedata
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - Windows fallback for local development.
+    fcntl = None
 
 
 class SyncError(ValueError):
@@ -62,20 +69,63 @@ def metadata_json(value):
     return json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
 
 
-def atomic_write_json(path, value):
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temp_path = path.with_name(f".{path.name}.tmp")
-    temp_path.write_text(metadata_json(value), encoding="utf-8")
-    os.replace(temp_path, path)
+def _fsync_directory(path):
+    try:
+        descriptor = os.open(path, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(descriptor)
+    except OSError as exc:
+        if exc.errno not in (errno.EINVAL, errno.ENOTSUP):
+            raise
+    finally:
+        os.close(descriptor)
 
 
 def atomic_write_bytes(path, value):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    temp_path = path.with_name(f".{path.name}.tmp")
-    temp_path.write_bytes(value)
-    os.replace(temp_path, path)
+    descriptor, temp_name = tempfile.mkstemp(
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+        dir=path.parent,
+    )
+    temp_path = Path(temp_name)
+    try:
+        if path.exists():
+            mode = path.stat().st_mode & 0o777
+            mode_applied = False
+            fchmod = getattr(os, "fchmod", None)
+            if fchmod is not None:
+                try:
+                    fchmod(descriptor, mode)
+                    mode_applied = True
+                except (NotImplementedError, OSError):
+                    pass
+            if not mode_applied:
+                try:
+                    os.chmod(temp_path, mode)
+                except (NotImplementedError, OSError):
+                    pass
+        with os.fdopen(descriptor, "wb") as temp_file:
+            descriptor = None
+            temp_file.write(value)
+            temp_file.flush()
+            os.fsync(temp_file.fileno())
+        os.replace(temp_path, path)
+        _fsync_directory(path.parent)
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        try:
+            temp_path.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def atomic_write_json(path, value):
+    atomic_write_bytes(path, metadata_json(value).encode("utf-8"))
 
 
 def normalize_relative_path(value):
@@ -135,19 +185,49 @@ class SyncStore:
         self.files_root = self.root / "files"
         self.state_path = self.root / "state.json"
         self.metadata_db_path = self.root / "metadata.db"
-        self.lock = threading.Lock()
+        self.process_lock_path = self.root / ".sync.lock"
+        self.lock = threading.RLock()
+        self._lock_context = threading.local()
+
+    @contextmanager
+    def _store_lock(self):
+        with self.lock:
+            depth = getattr(self._lock_context, "depth", 0)
+            if depth:
+                self._lock_context.depth = depth + 1
+                try:
+                    yield
+                finally:
+                    self._lock_context.depth -= 1
+                return
+
+            self.root.mkdir(parents=True, exist_ok=True)
+            lock_file = self.process_lock_path.open("a+b")
+            try:
+                if fcntl is not None:
+                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+                self._lock_context.depth = 1
+                try:
+                    yield
+                finally:
+                    self._lock_context.depth = 0
+                    if fcntl is not None:
+                        fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+            finally:
+                lock_file.close()
 
     def initialize(self):
-        self.root.mkdir(parents=True, exist_ok=True)
-        self.files_root.mkdir(parents=True, exist_ok=True)
-        self._ensure_git_repo(commit_existing=True)
-        self._ensure_metadata_store()
-        if not self.state_path.exists():
-            now = utc_now()
-            atomic_write_json(self.state_path, self._initial_state(now))
+        with self._store_lock():
+            self.root.mkdir(parents=True, exist_ok=True)
+            self.files_root.mkdir(parents=True, exist_ok=True)
+            self._ensure_git_repo(commit_existing=True)
+            self._ensure_metadata_store()
+            if not self.state_path.exists():
+                now = utc_now()
+                atomic_write_json(self.state_path, self._initial_state(now))
 
     def reset_repository(self, user=None):
-        with self.lock:
+        with self._store_lock():
             now = utc_now()
             if self.files_root.exists():
                 shutil.rmtree(self.files_root)
@@ -192,12 +272,12 @@ class SyncStore:
         }
 
     def manifest(self):
-        with self.lock:
+        with self._store_lock():
             state = self._load_state()
             return self._manifest_from_state(state)
 
     def file_payload(self, relative_path):
-        with self.lock:
+        with self._store_lock():
             relative_path = normalize_relative_path(relative_path)
             state = self._load_state()
             record = state["files"].get(relative_path)
@@ -208,7 +288,7 @@ class SyncStore:
             return self._file_change(relative_path, record)
 
     def attachment_payload(self, relative_path):
-        with self.lock:
+        with self._store_lock():
             relative_path = normalize_relative_path(relative_path)
             state = self._load_state()
             record = state["files"].get(relative_path)
@@ -221,7 +301,7 @@ class SyncStore:
             return self._file_change(relative_path, record)
 
     def file_history(self, relative_path):
-        with self.lock:
+        with self._store_lock():
             relative_path = normalize_relative_path(relative_path)
             state = self._load_state()
             record = state["files"].get(relative_path)
@@ -233,7 +313,7 @@ class SyncStore:
             }
 
     def file_version_payload(self, relative_path, commit):
-        with self.lock:
+        with self._store_lock():
             relative_path = normalize_relative_path(relative_path)
             state = self._load_state()
             record = state["files"].get(relative_path)
@@ -261,7 +341,7 @@ class SyncStore:
             return payload
 
     def rollback_file(self, relative_path, commit, user=None):
-        with self.lock:
+        with self._store_lock():
             relative_path = normalize_relative_path(relative_path)
             state = self._load_state()
             current = state["files"].get(relative_path)
@@ -562,7 +642,7 @@ class SyncStore:
             "knownAttachments",
         )
 
-        with self.lock:
+        with self._store_lock():
             state = self._load_state()
             now = utc_now()
             server_metadata = self._metadata_index()
@@ -611,15 +691,56 @@ class SyncStore:
         client_id = client_id.strip()
 
         base_revision = self._to_int(payload.get("baseRevision", 0), "baseRevision")
+        self._preflight_sync_item(payload, base_revision, kind="file")
 
-        with self.lock:
+        with self._store_lock():
             state = self._load_state()
             now = utc_now()
+            prepared_metadata = self._prepare_file_metadata_update(state, payload)
+            relative_path = normalize_relative_path(payload.get("relativePath"))
+            current_before = copy.deepcopy(state["files"].get(relative_path))
+            last_known_revision = self._to_int(
+                payload.get("lastKnownRevision", base_revision),
+                f"{relative_path}.lastKnownRevision",
+            )
             file_result = self._sync_file(state, payload, base_revision, now)
             metadata_result = None
 
+            if (
+                file_result["status"] == "unchanged"
+                and current_before
+                and current_before.get("revision", 0) > last_known_revision
+                and self._prepared_file_metadata_would_change(
+                    prepared_metadata,
+                    file_result.get("storagePath"),
+                )
+            ):
+                file_result = {
+                    "status": "conflict",
+                    "relativePath": relative_path,
+                    "clientRevision": last_known_revision,
+                    "serverRevision": current_before.get("revision", 0),
+                    "serverFile": self._file_change(relative_path, current_before),
+                }
+
             if file_result["status"] != "conflict":
-                metadata_result = self._sync_file_metadata(state, payload, now)
+                metadata_result = self._sync_file_metadata(
+                    state,
+                    payload,
+                    now,
+                    prepared=prepared_metadata,
+                    storage_path=file_result.get("storagePath"),
+                    advance_record_revision=bool(
+                        current_before
+                        and not current_before.get("deleted")
+                        and not file_result.get("deleted")
+                        and current_before.get("contentHash")
+                        == file_result.get("contentHash")
+                    ),
+                )
+                current = state["files"].get(relative_path)
+                if isinstance(current, dict):
+                    file_result["revision"] = current.get("revision", 0)
 
             self._record_client(
                 state,
@@ -649,12 +770,47 @@ class SyncStore:
         client_id = client_id.strip()
 
         base_revision = self._to_int(payload.get("baseRevision", 0), "baseRevision")
+        self._preflight_sync_item(payload, base_revision, kind="attachment")
 
-        with self.lock:
+        with self._store_lock():
             state = self._load_state()
             now = utc_now()
+            self._preflight_sync_item(
+                payload,
+                base_revision,
+                kind="attachment",
+                state=state,
+            )
+            prepared_metadata = self._preflight_attachment_metadata_update(
+                state,
+                payload,
+            )
+            relative_path = normalize_relative_path(payload.get("relativePath"))
+            current_before = copy.deepcopy(state["files"].get(relative_path))
+            last_known_revision = self._to_int(
+                payload.get("lastKnownRevision", base_revision),
+                f"{relative_path}.lastKnownRevision",
+            )
             attachment_result = self._sync_attachment(state, payload, base_revision, now)
             metadata_result = None
+
+            if (
+                attachment_result["status"] == "unchanged"
+                and current_before
+                and current_before.get("revision", 0) > last_known_revision
+                and self._prepared_attachment_metadata_would_change(
+                    prepared_metadata,
+                    attachment_result,
+                    state["files"].get(relative_path),
+                )
+            ):
+                attachment_result = {
+                    "status": "conflict",
+                    "relativePath": relative_path,
+                    "clientRevision": last_known_revision,
+                    "serverRevision": current_before.get("revision", 0),
+                    "serverFile": self._file_change(relative_path, current_before),
+                }
 
             if attachment_result["status"] != "conflict":
                 metadata_result = self._sync_attachment_metadata(
@@ -662,7 +818,19 @@ class SyncStore:
                     payload,
                     attachment_result,
                     now,
+                    prepared=prepared_metadata,
+                    advance_record_revision=bool(
+                        current_before
+                        and not current_before.get("deleted")
+                        and not attachment_result.get("deleted")
+                        and current_before.get("contentHash")
+                        == attachment_result.get("contentHash")
+                    ),
                 )
+                current = state["files"].get(relative_path)
+                if isinstance(current, dict):
+                    attachment_result["revision"] = current.get("revision", 0)
+                    attachment_result.update(self._attachment_result_metadata(current))
 
             self._record_client(
                 state,
@@ -703,8 +871,22 @@ class SyncStore:
         if not isinstance(attachments, list):
             raise SyncError("attachments must be a list.")
 
-        with self.lock:
+        if "metadata" in payload:
+            self._metadata_request_body(payload["metadata"], base_revision)
+        for item in files:
+            self._preflight_sync_item(item, base_revision, kind="file")
+        for item in attachments:
+            self._preflight_sync_item(item, base_revision, kind="attachment")
+
+        with self._store_lock():
             state = self._load_state()
+            for item in attachments:
+                self._preflight_sync_item(
+                    item,
+                    base_revision,
+                    kind="attachment",
+                    state=state,
+                )
             accepted = []
             conflicts = []
             accepted_attachments = []
@@ -734,6 +916,26 @@ class SyncStore:
                 )
                 if current and current.get("revision", 0) == last_known_revision:
                     metadata_deleted_file_paths.add(relative_path)
+            metadata_deleted_attachment_paths = set()
+            for item in attachments:
+                relative_path = normalize_relative_path(item.get("relativePath"))
+                deleted = self._to_bool(
+                    item.get("deleted"),
+                    f"{relative_path}.deleted",
+                )
+                if not deleted or "lastKnownRevision" not in item:
+                    continue
+                current = state["files"].get(relative_path)
+                last_known_revision = self._to_int(
+                    item.get("lastKnownRevision"),
+                    f"{relative_path}.lastKnownRevision",
+                )
+                if (
+                    current
+                    and self._is_attachment_record(current)
+                    and current.get("revision", 0) == last_known_revision
+                ):
+                    metadata_deleted_attachment_paths.add(relative_path)
             if "metadata" in payload:
                 metadata_result = self._sync_metadata(
                     state,
@@ -741,6 +943,9 @@ class SyncStore:
                     base_revision,
                     now,
                     allowed_removed_file_paths=metadata_deleted_file_paths,
+                    allowed_removed_attachment_paths=(
+                        metadata_deleted_attachment_paths
+                    ),
                 )
 
             for item in files:
@@ -867,6 +1072,7 @@ class SyncStore:
         base_revision,
         now,
         allowed_removed_file_paths=None,
+        allowed_removed_attachment_paths=None,
     ):
         if metadata_payload is None:
             return None
@@ -875,6 +1081,9 @@ class SyncStore:
             metadata_payload,
             base_revision,
         )
+
+        current_metadata = self._read_metadata_body() or self._empty_metadata()
+        self._validate_note_identity_transition(current_metadata, body, state=state)
 
         current = state["metadata"]
         if (
@@ -885,6 +1094,21 @@ class SyncStore:
                 "status": "conflict",
                 "revision": current.get("revision", 0),
                 "contentHash": current.get("contentHash"),
+                "serverMetadata": self._read_metadata_body(),
+            }
+
+        orphaned_attachments = self._metadata_orphaned_active_attachment_paths(
+            state,
+            body,
+            allowed_removed_attachment_paths,
+        )
+        if orphaned_attachments:
+            return {
+                "status": "conflict",
+                "reason": "metadata_removes_existing_server_attachments",
+                "revision": current.get("revision", 0),
+                "contentHash": current.get("contentHash"),
+                "orphanedAttachments": orphaned_attachments,
                 "serverMetadata": self._read_metadata_body(),
             }
 
@@ -932,6 +1156,90 @@ class SyncStore:
             kind="file",
             allow_hash_only=False,
         )
+
+    def _preflight_sync_item(self, item, base_revision, kind, state=None):
+        if not isinstance(item, dict):
+            raise SyncError("Each file sync item must be an object.")
+
+        relative_path = normalize_relative_path(item.get("relativePath"))
+        deleted = self._to_bool(item.get("deleted"), f"{relative_path}.deleted")
+        if deleted and "lastKnownRevision" not in item:
+            raise SyncError(
+                f"{relative_path}.lastKnownRevision is required when deleted is true."
+            )
+        self._to_int(
+            item.get("lastKnownRevision", base_revision),
+            f"{relative_path}.lastKnownRevision",
+        )
+        if item.get("updatedAtMs") is not None:
+            self._to_int(item.get("updatedAtMs"), f"{relative_path}.updatedAtMs")
+
+        note = item.get("note")
+        workspace = item.get("workspace")
+        attachment = item.get("attachment")
+        if note is not None and not isinstance(note, dict):
+            raise SyncError("note must be an object.")
+        if workspace is not None and not isinstance(workspace, dict):
+            raise SyncError("workspace must be an object.")
+        if workspace is not None and not workspace.get("id"):
+            raise SyncError("workspace.id is required.")
+        if attachment is not None and not isinstance(attachment, dict):
+            raise SyncError("attachment must be an object.")
+
+        if kind == "file" and note:
+            note_path = note.get("relativePath")
+            if note_path and normalize_relative_path(note_path) != relative_path:
+                raise SyncError(
+                    "note.relativePath must match the top-level relativePath "
+                    f"'{relative_path}'."
+                )
+        elif kind == "attachment":
+            if attachment and attachment.get("relativePath"):
+                attachment_path = normalize_relative_path(
+                    attachment.get("relativePath")
+                )
+                if attachment_path != relative_path:
+                    raise SyncError(
+                        "attachment.relativePath must match the top-level "
+                        f"relativePath '{relative_path}'."
+                    )
+            note_paths = []
+            current = (
+                state.get("files", {}).get(relative_path)
+                if isinstance(state, dict)
+                else None
+            )
+            for value in (
+                item.get("noteRelativePath"),
+                attachment.get("noteRelativePath") if attachment else None,
+                note.get("relativePath") if note else None,
+                current.get("noteRelativePath") if current else None,
+            ):
+                if value:
+                    note_paths.append(normalize_relative_path(value))
+            if len(set(note_paths)) > 1:
+                raise SyncError(
+                    "Attachment noteRelativePath values must all reference the same note."
+                )
+            if not deleted and state is not None and not note_paths:
+                raise SyncError("noteRelativePath is required for attachment upload.")
+
+        if deleted:
+            return
+
+        declared_hash = self._declared_content_hash(item)
+        hash_only = (
+            kind == "attachment"
+            and "content" not in item
+            and isinstance(declared_hash, str)
+            and bool(declared_hash)
+        )
+        if hash_only:
+            return
+        content = self._decode_content(item, relative_path)
+        content_hash = sha256_bytes(content)
+        if declared_hash and declared_hash != content_hash:
+            raise SyncError(f"{relative_path}.contentHash does not match content.")
 
     def _sync_attachment(self, state, item, base_revision, now):
         return self._sync_file_item(
@@ -1091,6 +1399,76 @@ class SyncStore:
             return result
 
         if current and self._same_file_state(current, deleted, content_hash):
+            next_storage_path = self._desired_storage_path(
+                state,
+                relative_path,
+                item,
+                kind,
+                current=current,
+            )
+            if next_storage_path != current_storage_path:
+                if current_revision > last_known_revision:
+                    return {
+                        "status": "conflict",
+                        "relativePath": relative_path,
+                        "clientRevision": last_known_revision,
+                        "serverRevision": current_revision,
+                        "serverFile": self._file_change(relative_path, current),
+                    }
+                current_file_path = self._file_path(relative_path, current)
+                if not current_file_path.exists():
+                    raise SyncError(
+                        f"Stored file for '{relative_path}' does not exist at "
+                        f"'{current_storage_path}'."
+                    )
+                self._move_storage_file_if_needed(
+                    current_storage_path,
+                    next_storage_path,
+                )
+                state["serverRevision"] += 1
+                git_commit = self._commit_file_change(
+                    relative_path,
+                    f"Move {relative_path}",
+                    storage_path=next_storage_path,
+                    previous_storage_path=current_storage_path,
+                )
+                next_record = copy.deepcopy(current)
+                next_record.update(
+                    {
+                        "revision": state["serverRevision"],
+                        "storagePath": next_storage_path,
+                        "serverUpdatedAt": now,
+                        "clientUpdatedAtMs": (
+                            item.get("updatedAtMs")
+                            if item.get("updatedAtMs") is not None
+                            else current.get("clientUpdatedAtMs")
+                        ),
+                        "gitCommit": git_commit,
+                    }
+                )
+                if kind == "attachment":
+                    next_record.update(
+                        self._attachment_record_metadata(
+                            item,
+                            relative_path,
+                            current=current,
+                            deleted=False,
+                        )
+                    )
+                state["files"][relative_path] = next_record
+                result = {
+                    "status": "accepted",
+                    "relativePath": relative_path,
+                    "revision": state["serverRevision"],
+                    "storagePath": next_storage_path,
+                    "contentHash": content_hash,
+                    "deleted": False,
+                    "gitCommit": git_commit,
+                }
+                if kind == "attachment":
+                    result.update(self._attachment_result_metadata(next_record))
+                return result
+
             result = {
                 "status": "unchanged",
                 "relativePath": relative_path,
@@ -1561,7 +1939,7 @@ class SyncStore:
 
         return restored
 
-    def _sync_file_metadata(self, state, payload, now):
+    def _prepare_file_metadata_update(self, state, payload):
         relative_path = normalize_relative_path(payload.get("relativePath"))
         deleted = self._to_bool(payload.get("deleted"), f"{relative_path}.deleted")
         note = payload.get("note")
@@ -1574,10 +1952,12 @@ class SyncStore:
         if not deleted and note is None and workspace is None:
             return None
 
-        metadata = self._read_metadata_body() or self._empty_metadata()
-        normalized_metadata = self._normalize_metadata_body(metadata)
-        changed = normalized_metadata != metadata
-        metadata = normalized_metadata
+        stored_metadata = self._read_metadata_body() or self._empty_metadata()
+        current_metadata = self._normalize_metadata_body(stored_metadata)
+        metadata = copy.deepcopy(current_metadata)
+        normalization_changed = current_metadata != stored_metadata
+        changed = normalization_changed
+        deleted_note = None
 
         if deleted:
             deleted_note = self._note_for_update(
@@ -1585,9 +1965,6 @@ class SyncStore:
                 relative_path,
                 create=False,
             )
-            record = state["files"].get(relative_path)
-            if deleted_note and isinstance(record, dict):
-                record["deletedNote"] = dict(deleted_note)
             changed = self._remove_note(metadata, relative_path) or changed
         else:
             if workspace:
@@ -1601,12 +1978,62 @@ class SyncStore:
 
             if note:
                 normalized_note = dict(note)
-                normalized_note.setdefault("relativePath", relative_path)
+                normalized_note["relativePath"] = relative_path
                 normalized_note.setdefault("fileName", PurePosixPath(relative_path).name)
                 folder = str(PurePosixPath(relative_path).parent)
                 if folder != ".":
                     normalized_note.setdefault("folder", folder)
+                if "attachments" not in normalized_note:
+                    current_note = self._note_for_update(
+                        metadata,
+                        relative_path,
+                        create=False,
+                    )
+                    if current_note and isinstance(current_note.get("attachments"), list):
+                        normalized_note["attachments"] = copy.deepcopy(
+                            current_note["attachments"]
+                        )
                 changed = self._upsert_note(metadata, normalized_note) or changed
+
+        metadata = self._normalize_metadata_body(metadata)
+        self._validate_note_identity_transition(
+            current_metadata,
+            metadata,
+            state=state,
+        )
+        return {
+            "metadata": metadata,
+            "currentMetadata": current_metadata,
+            "normalizationChanged": normalization_changed,
+            "deleted": deleted,
+            "deletedNote": copy.deepcopy(deleted_note),
+            "relativePath": relative_path,
+        }
+
+    def _sync_file_metadata(
+        self,
+        state,
+        payload,
+        now,
+        prepared=None,
+        storage_path=None,
+        advance_record_revision=False,
+    ):
+        prepared = prepared or self._prepare_file_metadata_update(state, payload)
+        if prepared is None:
+            return None
+
+        relative_path = prepared["relativePath"]
+        deleted = prepared["deleted"]
+        metadata = self._canonical_prepared_file_metadata(prepared, storage_path)
+        record = state["files"].get(relative_path)
+        if deleted:
+            if prepared.get("deletedNote") and isinstance(record, dict):
+                record["deletedNote"] = copy.deepcopy(prepared["deletedNote"])
+        changed = (
+            prepared.get("normalizationChanged", False)
+            or metadata != prepared["currentMetadata"]
+        )
 
         if not changed:
             if not deleted:
@@ -1617,7 +2044,11 @@ class SyncStore:
                 "contentHash": state["metadata"].get("contentHash"),
             }
 
-        metadata = self._normalize_metadata_body(metadata)
+        self._validate_note_identity_transition(
+            prepared["currentMetadata"],
+            metadata,
+            state=state,
+        )
         metadata["generatedAt"] = now
         content_hash = sha256_json(metadata)
         state["serverRevision"] += 1
@@ -1627,6 +2058,9 @@ class SyncStore:
             "contentHash": content_hash,
             "updatedAt": now,
         }
+        if advance_record_revision and isinstance(record, dict):
+            record["revision"] = state["serverRevision"]
+            record["serverUpdatedAt"] = now
         if not deleted:
             self._store_note_metadata_snapshot(state, relative_path, metadata)
         return {
@@ -1635,53 +2069,65 @@ class SyncStore:
             "contentHash": content_hash,
         }
 
-    def _sync_attachment_metadata(self, state, payload, attachment_result, now):
+    def _canonical_prepared_file_metadata(self, prepared, storage_path):
+        if prepared is None:
+            return None
+        metadata = copy.deepcopy(prepared["metadata"])
+        if not prepared["deleted"] and storage_path:
+            storage_path = normalize_relative_path(storage_path)
+            current_note = self._note_for_update(
+                metadata,
+                prepared["relativePath"],
+                create=False,
+            )
+            if current_note:
+                current_note["storagePath"] = storage_path
+                current_note["fileName"] = PurePosixPath(storage_path).name
+        return self._normalize_metadata_body(metadata)
+
+    def _prepared_file_metadata_would_change(self, prepared, storage_path):
+        if prepared is None:
+            return False
+        metadata = self._canonical_prepared_file_metadata(prepared, storage_path)
+        return bool(
+            prepared.get("normalizationChanged", False)
+            or metadata != prepared["currentMetadata"]
+        )
+
+    def _preflight_attachment_metadata_update(self, state, payload):
         relative_path = normalize_relative_path(payload.get("relativePath"))
-        deleted = bool(payload.get("deleted", False))
+        deleted = self._to_bool(payload.get("deleted"), f"{relative_path}.deleted")
         attachment = payload.get("attachment")
         note = payload.get("note")
         workspace = payload.get("workspace")
-
-        if attachment is not None and not isinstance(attachment, dict):
-            raise SyncError("attachment must be an object.")
-        if note is not None and not isinstance(note, dict):
-            raise SyncError("note must be an object.")
-        if workspace is not None and not isinstance(workspace, dict):
-            raise SyncError("workspace must be an object.")
-
-        record = state["files"].get(relative_path) or {}
+        current_record = state["files"].get(relative_path) or {}
         note_relative_path = (
             payload.get("noteRelativePath")
             or (attachment.get("noteRelativePath") if isinstance(attachment, dict) else None)
             or (note.get("relativePath") if isinstance(note, dict) else None)
-            or record.get("noteRelativePath")
-            or attachment_result.get("noteRelativePath")
+            or current_record.get("noteRelativePath")
         )
         if not note_relative_path:
-            return {
-                "status": "unchanged",
-                "revision": state["metadata"].get("revision", 0),
-                "contentHash": state["metadata"].get("contentHash"),
-            }
+            return None
         note_relative_path = normalize_relative_path(note_relative_path)
 
-        metadata = self._read_metadata_body() or self._empty_metadata()
-        normalized_metadata = self._normalize_metadata_body(metadata)
-        changed = normalized_metadata != metadata
-        metadata = normalized_metadata
-
+        stored_metadata = self._read_metadata_body() or self._empty_metadata()
+        current_metadata = self._normalize_metadata_body(stored_metadata)
+        metadata = copy.deepcopy(current_metadata)
         if workspace:
-            changed = self._upsert_workspace(metadata, workspace) or changed
+            self._upsert_workspace(metadata, workspace)
         elif note and note.get("workspace"):
-            workspace_from_note = {
-                "id": note.get("workspace"),
-                "name": note.get("workspaceName") or note.get("workspace"),
-            }
-            changed = self._upsert_workspace(metadata, workspace_from_note) or changed
+            self._upsert_workspace(
+                metadata,
+                {
+                    "id": note.get("workspace"),
+                    "name": note.get("workspaceName") or note.get("workspace"),
+                },
+            )
 
         if note:
             normalized_note = dict(note)
-            normalized_note.setdefault("relativePath", note_relative_path)
+            normalized_note["relativePath"] = note_relative_path
             normalized_note.setdefault(
                 "fileName",
                 PurePosixPath(note_relative_path).name,
@@ -1693,30 +2139,157 @@ class SyncStore:
                     create=False,
                 )
                 if current_note and isinstance(current_note.get("attachments"), list):
-                    normalized_note["attachments"] = current_note["attachments"]
-            changed = self._upsert_note(metadata, normalized_note) or changed
+                    normalized_note["attachments"] = copy.deepcopy(
+                        current_note["attachments"]
+                    )
+            self._upsert_note(metadata, normalized_note)
         else:
-            changed = self._ensure_note(metadata, note_relative_path) or changed
+            self._ensure_note(metadata, note_relative_path)
+
+        current_attachments = self._attachments_by_path(current_metadata)
+        for current_path, entry in self._state_attachment_identities(state).items():
+            current_attachments.setdefault(current_path, entry)
+        incoming_id = None
+        if isinstance(attachment, dict):
+            incoming_id = attachment.get("id") or attachment.get("attachmentId")
+        incoming_id = incoming_id or payload.get("attachmentId")
+        current_at_path = current_attachments.get(relative_path)
+        current_attachment = (
+            current_at_path.get("attachment") if current_at_path else None
+        )
+        current_id = (
+            current_attachment.get("id") or current_attachment.get("attachmentId")
+            if current_attachment
+            else None
+        )
+        if current_id and incoming_id and current_id != incoming_id:
+            raise SyncError(
+                f"Attachment relativePath '{relative_path}' is already assigned to "
+                f"attachment id '{current_id}', not '{incoming_id}'."
+            )
+        if incoming_id:
+            for current_path, entry in current_attachments.items():
+                current = entry.get("attachment") or {}
+                candidate_id = current.get("id") or current.get("attachmentId")
+                if candidate_id == incoming_id and current_path != relative_path:
+                    raise SyncError(
+                        f"Attachment id '{incoming_id}' is already assigned to "
+                        f"relativePath '{current_path}', not '{relative_path}'."
+                    )
 
         if deleted:
-            changed = (
-                self._remove_note_attachment(metadata, note_relative_path, relative_path)
-                or changed
+            self._remove_note_attachment(
+                metadata,
+                note_relative_path,
+                relative_path,
             )
         else:
-            normalized_attachment = self._normalized_attachment_metadata(
+            next_attachment = self._normalized_attachment_metadata(
                 payload,
+                {},
+                current_record,
+                current_attachment=current_attachment,
+            )
+            next_attachment["noteRelativePath"] = note_relative_path
+            if incoming_id:
+                next_attachment["id"] = incoming_id
+            self._upsert_note_attachment(
+                metadata,
+                note_relative_path,
+                next_attachment,
+            )
+
+        metadata = self._normalize_metadata_body(metadata)
+        self._validate_note_identity_transition(
+            current_metadata,
+            metadata,
+            state=state,
+        )
+        return {
+            "metadata": metadata,
+            "currentMetadata": current_metadata,
+            "normalizationChanged": current_metadata != stored_metadata,
+            "deleted": deleted,
+            "noteRelativePath": note_relative_path,
+            "relativePath": relative_path,
+            "payload": copy.deepcopy(payload),
+        }
+
+    def _canonical_prepared_attachment_metadata(
+        self,
+        prepared,
+        attachment_result,
+        record,
+    ):
+        if prepared is None:
+            return None
+        metadata = copy.deepcopy(prepared["metadata"])
+        if not prepared["deleted"]:
+            current_entry = self._attachments_by_path(metadata).get(
+                prepared["relativePath"]
+            )
+            current_attachment = (
+                current_entry.get("attachment") if current_entry else None
+            )
+            normalized_attachment = self._normalized_attachment_metadata(
+                prepared["payload"],
                 attachment_result,
-                record,
+                record or {},
+                current_attachment=current_attachment,
             )
-            changed = (
-                self._upsert_note_attachment(
-                    metadata,
-                    note_relative_path,
-                    normalized_attachment,
-                )
-                or changed
+            normalized_attachment["noteRelativePath"] = prepared["noteRelativePath"]
+            self._upsert_note_attachment(
+                metadata,
+                prepared["noteRelativePath"],
+                normalized_attachment,
             )
+        return self._normalize_metadata_body(metadata)
+
+    def _prepared_attachment_metadata_would_change(
+        self,
+        prepared,
+        attachment_result,
+        record,
+    ):
+        if prepared is None:
+            return False
+        metadata = self._canonical_prepared_attachment_metadata(
+            prepared,
+            attachment_result,
+            record,
+        )
+        return bool(
+            prepared.get("normalizationChanged", False)
+            or metadata != prepared["currentMetadata"]
+        )
+
+    def _sync_attachment_metadata(
+        self,
+        state,
+        payload,
+        attachment_result,
+        now,
+        prepared=None,
+        advance_record_revision=False,
+    ):
+        prepared = prepared or self._preflight_attachment_metadata_update(
+            state,
+            payload,
+        )
+        if prepared is None:
+            return None
+        relative_path = prepared["relativePath"]
+        note_relative_path = prepared["noteRelativePath"]
+        record = state["files"].get(relative_path) or {}
+        metadata = self._canonical_prepared_attachment_metadata(
+            prepared,
+            attachment_result,
+            record,
+        )
+        changed = (
+            prepared.get("normalizationChanged", False)
+            or metadata != prepared["currentMetadata"]
+        )
 
         if not changed:
             self._store_attachment_metadata_snapshot(
@@ -1732,7 +2305,11 @@ class SyncStore:
                 "contentHash": state["metadata"].get("contentHash"),
             }
 
-        metadata = self._normalize_metadata_body(metadata)
+        self._validate_note_identity_transition(
+            prepared["currentMetadata"],
+            metadata,
+            state=state,
+        )
         metadata["generatedAt"] = now
         content_hash = sha256_json(metadata)
         state["serverRevision"] += 1
@@ -1742,6 +2319,18 @@ class SyncStore:
             "contentHash": content_hash,
             "updatedAt": now,
         }
+        if advance_record_revision and isinstance(record, dict):
+            record["revision"] = state["serverRevision"]
+            record["serverUpdatedAt"] = now
+        if isinstance(record, dict) and not prepared["deleted"]:
+            record.update(
+                self._attachment_record_metadata(
+                    payload,
+                    relative_path,
+                    current=record,
+                    deleted=False,
+                )
+            )
         self._store_attachment_metadata_snapshot(
             state,
             relative_path,
@@ -2682,6 +3271,27 @@ class SyncStore:
         )
         return sorted(orphaned_paths)
 
+    def _metadata_orphaned_active_attachment_paths(
+        self,
+        state,
+        metadata,
+        allowed_removed_attachment_paths=None,
+    ):
+        active_attachment_paths = {
+            relative_path
+            for relative_path, record in state["files"].items()
+            if not record.get("deleted") and self._is_attachment_record(record)
+        }
+        next_attachment_paths = set(self._attachments_by_path(metadata))
+        allowed_removed_attachment_paths = set(
+            allowed_removed_attachment_paths or []
+        )
+        return sorted(
+            active_attachment_paths
+            - next_attachment_paths
+            - allowed_removed_attachment_paths
+        )
+
     def _known_delete_requested(self, known):
         return bool(known and known.get("deleted"))
 
@@ -2736,7 +3346,12 @@ class SyncStore:
             relative_path = note.get("relativePath")
             if not relative_path:
                 continue
-            by_path[normalize_relative_path(relative_path)] = note
+            relative_path = normalize_relative_path(relative_path)
+            if relative_path in by_path:
+                raise SyncError(
+                    f"metadata.notes contains duplicate relativePath '{relative_path}'."
+                )
+            by_path[relative_path] = note
         return by_path
 
     def _attachments_by_path(self, metadata):
@@ -2745,6 +3360,7 @@ class SyncStore:
             raise SyncError("metadata.notes must be a list.")
 
         by_path = {}
+        paths_by_id = {}
         for note in notes:
             if not isinstance(note, dict):
                 raise SyncError("Each metadata note must be an object.")
@@ -2766,12 +3382,27 @@ class SyncStore:
                 if not relative_path:
                     continue
                 relative_path = normalize_relative_path(relative_path)
+                if relative_path in by_path:
+                    raise SyncError(
+                        "metadata attachments contain duplicate relativePath "
+                        f"'{relative_path}'."
+                    )
                 normalized = dict(attachment)
                 normalized["relativePath"] = relative_path
                 if note_relative_path:
                     normalized.setdefault("noteRelativePath", note_relative_path)
                 if note.get("id"):
                     normalized.setdefault("noteId", note.get("id"))
+                attachment_id = normalized.get("id") or normalized.get("attachmentId")
+                if attachment_id:
+                    previous_path = paths_by_id.get(attachment_id)
+                    if previous_path is not None:
+                        raise SyncError(
+                            "metadata attachments contain duplicate id "
+                            f"'{attachment_id}' for '{previous_path}' and "
+                            f"'{relative_path}'."
+                        )
+                    paths_by_id[attachment_id] = relative_path
                 by_path[relative_path] = {
                     "attachment": normalized,
                     "note": note,
@@ -3047,6 +3678,228 @@ class SyncStore:
 
         return canonical_workspace_id
 
+    def _metadata_identity_value(self, value, field_name):
+        if value is None or value == "":
+            return None
+        if not isinstance(value, str) or not value.strip():
+            raise SyncError(f"{field_name} must be a non-empty string when provided.")
+        return value.strip()
+
+    def _validate_metadata_identity(self, body):
+        if not isinstance(body, dict):
+            raise SyncError("metadata body must be an object.")
+
+        notes = body.get("notes", [])
+        if not isinstance(notes, list):
+            raise SyncError("metadata.notes must be a list.")
+
+        note_paths = {}
+        note_ids = {}
+        attachment_paths = {}
+        attachment_ids = {}
+        for note_index, note in enumerate(notes):
+            if not isinstance(note, dict):
+                raise SyncError("Each metadata note must be an object.")
+
+            raw_note_path = note.get("relativePath")
+            note_path = (
+                normalize_relative_path(raw_note_path) if raw_note_path else None
+            )
+            if note_path:
+                previous_index = note_paths.get(note_path)
+                if previous_index is not None:
+                    raise SyncError(
+                        "metadata.notes contains duplicate relativePath "
+                        f"'{note_path}' at indexes {previous_index} and {note_index}."
+                    )
+                note_paths[note_path] = note_index
+
+            note_id = self._metadata_identity_value(
+                note.get("id"),
+                f"metadata.notes[{note_index}].id",
+            )
+            if note_id:
+                previous_path = note_ids.get(note_id)
+                if previous_path is not None:
+                    raise SyncError(
+                        "metadata.notes contains duplicate id "
+                        f"'{note_id}' for '{previous_path}' and "
+                        f"'{note_path or f'index {note_index}'}'."
+                    )
+                note_ids[note_id] = note_path or f"index {note_index}"
+
+            attachments = note.get("attachments", [])
+            if attachments is None:
+                continue
+            if not isinstance(attachments, list):
+                raise SyncError("note.attachments must be a list.")
+
+            for attachment_index, attachment in enumerate(attachments):
+                if not isinstance(attachment, dict):
+                    raise SyncError("Each note attachment must be an object.")
+                raw_attachment_path = attachment.get("relativePath")
+                attachment_path = (
+                    normalize_relative_path(raw_attachment_path)
+                    if raw_attachment_path
+                    else None
+                )
+                if attachment_path:
+                    previous_owner = attachment_paths.get(attachment_path)
+                    if previous_owner is not None:
+                        raise SyncError(
+                            "metadata attachments contain duplicate relativePath "
+                            f"'{attachment_path}' for '{previous_owner}' and "
+                            f"'{note_path or f'note index {note_index}'}'."
+                        )
+                    attachment_paths[attachment_path] = (
+                        note_path or f"note index {note_index}"
+                    )
+
+                attachment_id = self._metadata_identity_value(
+                    attachment.get("id") or attachment.get("attachmentId"),
+                    (
+                        f"metadata.notes[{note_index}].attachments"
+                        f"[{attachment_index}].id"
+                    ),
+                )
+                if attachment_id:
+                    previous_path = attachment_ids.get(attachment_id)
+                    if previous_path is not None:
+                        raise SyncError(
+                            "metadata attachments contain duplicate id "
+                            f"'{attachment_id}' for '{previous_path}' and "
+                            f"'{attachment_path or f'index {attachment_index}'}'."
+                        )
+                    attachment_ids[attachment_id] = (
+                        attachment_path or f"index {attachment_index}"
+                    )
+
+                declared_note_path = attachment.get("noteRelativePath")
+                if declared_note_path and note_path:
+                    declared_note_path = normalize_relative_path(declared_note_path)
+                    if declared_note_path != note_path:
+                        raise SyncError(
+                            f"Attachment '{attachment_path}' noteRelativePath must "
+                            f"match its parent note relativePath '{note_path}'."
+                        )
+
+    def _state_note_identities(self, state):
+        notes = {}
+        if not isinstance(state, dict):
+            return notes
+        for relative_path, record in state.get("files", {}).items():
+            if record.get("deleted") or self._is_attachment_record(record):
+                continue
+            snapshot = record.get("noteSnapshot") or record.get("deletedNote")
+            if not isinstance(snapshot, dict) or not snapshot.get("id"):
+                continue
+            note = copy.deepcopy(snapshot)
+            note["relativePath"] = relative_path
+            notes[relative_path] = note
+        return notes
+
+    def _state_attachment_identities(self, state):
+        attachments = {}
+        if not isinstance(state, dict):
+            return attachments
+        for relative_path, record in state.get("files", {}).items():
+            if record.get("deleted") or not self._is_attachment_record(record):
+                continue
+            snapshot = record.get("attachmentSnapshot")
+            if not isinstance(snapshot, dict):
+                snapshot = self._attachment_snapshot_from_record(record, relative_path)
+            else:
+                snapshot = copy.deepcopy(snapshot)
+            snapshot["relativePath"] = relative_path
+            snapshot.setdefault("id", record.get("attachmentId"))
+            snapshot.setdefault("noteRelativePath", record.get("noteRelativePath"))
+            attachments[relative_path] = {
+                "attachment": snapshot,
+                "note": copy.deepcopy(record.get("noteSnapshot")),
+            }
+        return attachments
+
+    def _validate_note_identity_transition(
+        self,
+        current_metadata,
+        next_metadata,
+        state=None,
+    ):
+        self._validate_metadata_identity(current_metadata)
+        self._validate_metadata_identity(next_metadata)
+        current_notes = self._notes_by_path(current_metadata)
+        for relative_path, note in self._state_note_identities(state).items():
+            current_notes.setdefault(relative_path, note)
+        next_notes = self._notes_by_path(next_metadata)
+        current_paths_by_id = {
+            note.get("id"): relative_path
+            for relative_path, note in current_notes.items()
+            if note.get("id")
+        }
+
+        for relative_path, note in next_notes.items():
+            note_id = note.get("id")
+            current_at_path = current_notes.get(relative_path)
+            current_id = current_at_path.get("id") if current_at_path else None
+            if current_id and not note_id:
+                raise SyncError(
+                    f"Note relativePath '{relative_path}' must preserve existing "
+                    f"note id '{current_id}'."
+                )
+            if current_id and note_id and current_id != note_id:
+                raise SyncError(
+                    f"Note relativePath '{relative_path}' is already assigned to "
+                    f"note id '{current_id}', not '{note_id}'."
+                )
+            previous_path = current_paths_by_id.get(note_id) if note_id else None
+            if previous_path and previous_path != relative_path:
+                raise SyncError(
+                    f"Note id '{note_id}' is already assigned to relativePath "
+                    f"'{previous_path}', not '{relative_path}'."
+                )
+
+        current_attachments = self._attachments_by_path(current_metadata)
+        for relative_path, entry in self._state_attachment_identities(state).items():
+            current_attachments.setdefault(relative_path, entry)
+        next_attachments = self._attachments_by_path(next_metadata)
+        current_attachment_paths_by_id = {}
+        for relative_path, entry in current_attachments.items():
+            attachment = entry.get("attachment") or {}
+            attachment_id = attachment.get("id") or attachment.get("attachmentId")
+            if attachment_id:
+                current_attachment_paths_by_id[attachment_id] = relative_path
+
+        for relative_path, entry in next_attachments.items():
+            attachment = entry.get("attachment") or {}
+            attachment_id = attachment.get("id") or attachment.get("attachmentId")
+            current_entry = current_attachments.get(relative_path)
+            current_attachment = (
+                current_entry.get("attachment") if current_entry else None
+            ) or {}
+            current_id = current_attachment.get("id") or current_attachment.get(
+                "attachmentId"
+            )
+            if current_id and not attachment_id:
+                raise SyncError(
+                    f"Attachment relativePath '{relative_path}' must preserve "
+                    f"existing attachment id '{current_id}'."
+                )
+            if current_id and attachment_id and current_id != attachment_id:
+                raise SyncError(
+                    f"Attachment relativePath '{relative_path}' is already assigned "
+                    f"to attachment id '{current_id}', not '{attachment_id}'."
+                )
+            previous_path = (
+                current_attachment_paths_by_id.get(attachment_id)
+                if attachment_id
+                else None
+            )
+            if previous_path and previous_path != relative_path:
+                raise SyncError(
+                    f"Attachment id '{attachment_id}' is already assigned to "
+                    f"relativePath '{previous_path}', not '{relative_path}'."
+                )
+
     def _normalize_metadata_note(
         self,
         note,
@@ -3088,6 +3941,8 @@ class SyncStore:
     def _normalize_metadata_body(self, body):
         if not isinstance(body, dict):
             raise SyncError("metadata body must be an object.")
+
+        self._validate_metadata_identity(body)
 
         normalized = copy.deepcopy(body)
         workspaces = normalized.get("workspaces", [])
@@ -3179,14 +4034,34 @@ class SyncStore:
         )
         relative_path = normalize_relative_path(note.get("relativePath"))
         notes = metadata.setdefault("notes", [])
+        note_id = note.get("id")
+        if note_id:
+            for current in notes:
+                if (
+                    current.get("id") == note_id
+                    and current.get("relativePath") != relative_path
+                ):
+                    raise SyncError(
+                        f"Note id '{note_id}' is already assigned to relativePath "
+                        f"'{current.get('relativePath')}', not '{relative_path}'."
+                    )
+
         for index, current in enumerate(notes):
-            same_path = current.get("relativePath") == relative_path
-            same_id = note.get("id") and current.get("id") == note.get("id")
-            if same_path or same_id:
-                if current == note:
-                    return False
-                notes[index] = dict(note)
-                return True
+            if current.get("relativePath") != relative_path:
+                continue
+            current_id = current.get("id")
+            if current_id and note_id and current_id != note_id:
+                raise SyncError(
+                    f"Note relativePath '{relative_path}' is already assigned to "
+                    f"note id '{current_id}', not '{note_id}'."
+                )
+            next_note = dict(note)
+            if current_id and not note_id:
+                next_note["id"] = current_id
+            if current == next_note:
+                return False
+            notes[index] = next_note
+            return True
 
         notes.append(dict(note))
         return True
@@ -3222,11 +4097,21 @@ class SyncStore:
         metadata["notes"] = next_notes
         return True
 
-    def _normalized_attachment_metadata(self, payload, attachment_result, record):
+    def _normalized_attachment_metadata(
+        self,
+        payload,
+        attachment_result,
+        record,
+        current_attachment=None,
+    ):
         attachment = payload.get("attachment")
         if attachment is not None and not isinstance(attachment, dict):
             raise SyncError("attachment must be an object.")
-        attachment = dict(attachment or {})
+        normalized = dict(current_attachment or {})
+        normalized.update(attachment or {})
+        attachment = normalized
+        attachment_result = attachment_result or {}
+        record = record or {}
         relative_path = normalize_relative_path(payload.get("relativePath"))
 
         attachment["relativePath"] = relative_path
@@ -3259,8 +4144,22 @@ class SyncStore:
             "size",
             attachment_result.get("size") or record.get("size", 0),
         )
+        actual_content_hash = attachment_result.get("contentHash") or record.get(
+            "contentHash"
+        )
+        if actual_content_hash:
+            attachment["contentHash"] = actual_content_hash
+        if record.get("size") is not None:
+            attachment["size"] = record.get("size")
         if payload.get("updatedAtMs") is not None:
             attachment["updatedAtMs"] = payload.get("updatedAtMs")
+        storage_path = attachment_result.get("storagePath") or record.get(
+            "storagePath"
+        )
+        if storage_path:
+            storage_path = normalize_relative_path(storage_path)
+            attachment["storagePath"] = storage_path
+            attachment["fileName"] = PurePosixPath(storage_path).name
         attachment["deleted"] = False
         return {key: value for key, value in attachment.items() if value is not None}
 
@@ -3346,6 +4245,8 @@ class SyncStore:
 
     def _desired_note_storage_path(self, relative_path, item, current=None):
         note = item.get("note") if isinstance(item.get("note"), dict) else {}
+        if not note and isinstance(current, dict) and current.get("storagePath"):
+            return self._storage_path_for_record(relative_path, current)
         path = PurePosixPath(relative_path)
         parts = self._storage_folder_parts_for_note(note, relative_path)
         fallback_stem = path.stem or "note"
@@ -3398,6 +4299,20 @@ class SyncStore:
             item.get("attachment") if isinstance(item.get("attachment"), dict) else {}
         )
         note = item.get("note") if isinstance(item.get("note"), dict) else {}
+        if (
+            not note
+            and isinstance(current, dict)
+            and isinstance(current.get("noteSnapshot"), dict)
+        ):
+            note = current["noteSnapshot"]
+        if (
+            not attachment
+            and not note
+            and not item.get("fileName")
+            and isinstance(current, dict)
+            and current.get("storagePath")
+        ):
+            return self._storage_path_for_record(relative_path, current)
         note_relative_path = (
             item.get("noteRelativePath")
             or attachment.get("noteRelativePath")
@@ -3431,11 +4346,29 @@ class SyncStore:
 
     def _unique_storage_path(self, state, relative_path, desired_path):
         desired_path = normalize_relative_path(desired_path)
+        current_record = state["files"].get(relative_path)
+        current_storage_path = (
+            self._storage_path_for_record(relative_path, current_record)
+            if current_record and not current_record.get("deleted")
+            else None
+        )
         used_paths = {
             self._storage_path_for_record(path, record)
             for path, record in state["files"].items()
             if path != relative_path and not record.get("deleted")
         }
+        if self.files_root.exists():
+            for physical_path in self.files_root.rglob("*"):
+                if not physical_path.is_file():
+                    continue
+                relative_parts = physical_path.relative_to(self.files_root).parts
+                if ".git" in relative_parts:
+                    continue
+                physical_storage_path = normalize_relative_path(
+                    physical_path.relative_to(self.files_root).as_posix()
+                )
+                if physical_storage_path != current_storage_path:
+                    used_paths.add(physical_storage_path)
         if desired_path not in used_paths:
             return desired_path
 
