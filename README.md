@@ -22,11 +22,13 @@ Notedown Sync Server는 Notedown 앱의 워크스페이스, 노트 메타데이�
 - `storage/metadata.db` SQLite 저장소 기반 워크스페이스/노트/첨부 메타데이터 관리
 - 동기화 식별자인 `relativePath`와 실제 읽기 쉬운 파일 경로인 `storagePath` 분리
 - 파일별 리비전, 콘텐츠 해시, 삭제 tombstone 기반 변경 추적
+- 기기 시계가 아닌 서버 Git 콘텐츠 계보를 이용한 양쪽 변경 충돌 판정
+- 파일·메타데이터·상태를 함께 보호하는 내구성 트랜잭션과 재시작 복구
 - `/api/sync/plan` 기반 업로드/다운로드/삭제 계획 생성
 - `/api/sync/file` 기반 단일 파일 업로드
 - `/api/sync/attachment` 기반 첨부 파일 업로드
 - `/api/files/{relativePath}`, `/api/attachments/{relativePath}` 기반 파일 다운로드
-- `/api/sync` 배치 동기화 API
+- 충돌 시 어떤 항목도 반영하지 않는 원자적 `/api/sync` 배치 동기화 API
 - 최초 실행 `/setup` 화면 또는 환경변수 기반 관리자 계정 설정
 - Bearer 토큰 발급, 사용 기록 저장, 관리자 UI에서 토큰 폐기
 - `/admin` 관리 화면에서 서버 상태, 클라이언트, 토큰, 파일, 파일 이력 확인
@@ -92,6 +94,7 @@ python -c "from werkzeug.security import generate_password_hash; print(generate_
 - `storage/files/`: 동기화된 마크다운 파일, 첨부 파일, 내부 Git 저장소. 실제 파일은 워크스페이스 이름, 노트 제목, 첨부 파일명을 기반으로 읽기 쉬운 `storagePath`에 저장됩니다.
 - `storage/auth.json`: `/setup`에서 만든 파일 기반 관리자 계정
 - `storage/tokens.json`: 발급된 앱 토큰과 최근 사용 정보
+- `storage/.sync-transaction/`: 동기화 변경 중에만 존재하는 복구 체크포인트. 중단 후 서버 시작 시 자동 롤백됩니다.
 
 `metadata.json`은 더 이상 생성하지 않습니다. `storage/files`는 서버 시작 시 Git 저장소로 초기화됩니다. 파일 저장, 삭제, 롤백은 Git 커밋으로 기록됩니다.
 
@@ -153,6 +156,12 @@ Authorization: Bearer <accessToken>
 7. 각 처리 후 응답의 `manifest.serverRevision`과 파일/첨부별 `revision`을 로컬 동기화 상태에 저장합니다.
 8. `plan.conflicts`가 있으면 자동 덮어쓰기 대신 사용자 선택 또는 병합 UI를 거칩니다.
 9. 파일 저장 이벤트가 발생하면 전체 동기화를 기다리지 않고 `/api/sync/file` 또는 `/api/sync/attachment`로 변경 항목만 업로드할 수 있습니다.
+
+레거시 `/api/sync` 배치 요청은 메타데이터·파일·첨부 중 하나라도 충돌하면
+아무 항목도 저장하지 않습니다. 이 경우 `accepted`/`acceptedAttachments`는
+비어 있고, 쓰지 않은 사전 판정 결과는 `skipped`/`skippedAttachments`에
+반환됩니다. 한 요청 안에서 같은 `relativePath`를 중복 전송하면 쓰기 전에
+400 오류로 거부됩니다.
 
 ### 예시 요청
 
@@ -286,11 +295,13 @@ Notedown Sync Server is a Flask-based synchronization service for Notedown works
 - Stores workspace, note, and attachment metadata in `storage/metadata.db` SQLite tables
 - Separates `relativePath` as the sync identity from readable physical `storagePath` values
 - Tracks per-file revisions, content hashes, and deletion tombstones
+- Detects two-sided changes from Git-backed content ancestry instead of device clocks
+- Protects files, metadata, and state with durable transactions and restart recovery
 - Builds upload, download, and delete plans through `/api/sync/plan`
 - Accepts single-file uploads and deletes through `/api/sync/file`
 - Accepts attachment uploads and deletes through `/api/sync/attachment`
 - Downloads files through `/api/files/{relativePath}` and attachments through `/api/attachments/{relativePath}`
-- Provides the batch `/api/sync` endpoint
+- Provides an atomic `/api/sync` batch endpoint that applies nothing on conflict
 - Supports first-run `/setup` credentials or environment-managed admin credentials
 - Issues Bearer tokens and lets admins revoke tokens from the web UI
 - Provides an `/admin` UI for server status, clients, tokens, files, history, rollback, and storage reset
@@ -355,6 +366,7 @@ The default storage directory is `storage/`.
 - `storage/files/`: synchronized markdown files, attachments, and the internal Git repository. Actual files use readable `storagePath` values based on workspace names, note titles, and attachment names.
 - `storage/auth.json`: file-backed admin credentials created by `/setup`
 - `storage/tokens.json`: issued app tokens and last-used metadata
+- `storage/.sync-transaction/`: temporary recovery checkpoint used during a mutation and rolled back automatically after an interrupted restart
 
 `metadata.json` is no longer generated. `storage/files` is initialized as a Git repository when the server starts. File saves, deletes, and rollbacks are recorded as commits.
 
@@ -418,6 +430,12 @@ Authorization: Bearer <accessToken>
 7. Store `manifest.serverRevision` and each file/attachment `revision` in the client's sync state.
 8. If `plan.conflicts` is not empty, ask the user to choose or merge instead of overwriting automatically.
 9. On file-save events, upload only the changed item with `/api/sync/file` or `/api/sync/attachment`.
+
+The legacy `/api/sync` batch endpoint does not persist any metadata, file, or
+attachment when one item conflicts. In that response, `accepted` and
+`acceptedAttachments` are empty, while preflight results that were not written
+are returned in `skipped` and `skippedAttachments`. Duplicate `relativePath`
+entries in one request are rejected with HTTP 400 before any write.
 
 ### Example Requests
 

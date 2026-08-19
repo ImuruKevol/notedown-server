@@ -32,6 +32,14 @@ UNSAFE_FILENAME_RE = re.compile(r'[<>:"\\|?*]+')
 MULTISPACE_RE = re.compile(r"\s+")
 MAX_STORAGE_SEGMENT_LENGTH = 120
 METADATA_DB_SCHEMA_VERSION = 1
+MAX_CLIENT_ID_LENGTH = 256
+MAX_TRACKED_CLIENTS = 128
+MAX_CLIENT_INFO_DEPTH = 4
+MAX_CLIENT_INFO_KEYS = 32
+MAX_CLIENT_INFO_LIST_ITEMS = 32
+MAX_CLIENT_INFO_STRING_LENGTH = 1024
+MAX_CONTENT_HASH_HISTORY = 64
+TRANSACTION_SCHEMA_VERSION = 1
 
 
 def utc_now():
@@ -186,6 +194,7 @@ class SyncStore:
         self.state_path = self.root / "state.json"
         self.metadata_db_path = self.root / "metadata.db"
         self.process_lock_path = self.root / ".sync.lock"
+        self.transaction_root = self.root / ".sync-transaction"
         self.lock = threading.RLock()
         self._lock_context = threading.local()
 
@@ -220,11 +229,179 @@ class SyncStore:
         with self._store_lock():
             self.root.mkdir(parents=True, exist_ok=True)
             self.files_root.mkdir(parents=True, exist_ok=True)
+            self._ensure_git_repo(commit_existing=False)
+            self._recover_pending_transaction()
             self._ensure_git_repo(commit_existing=True)
+            self._ensure_git_head()
             self._ensure_metadata_store()
             if not self.state_path.exists():
                 now = utc_now()
                 atomic_write_json(self.state_path, self._initial_state(now))
+
+    @contextmanager
+    def _mutation_transaction(self):
+        self._begin_mutation_transaction()
+        try:
+            yield
+        except BaseException:
+            try:
+                self._rollback_pending_transaction()
+            except Exception as rollback_exc:
+                raise SyncError(
+                    "Sync mutation failed and the durable rollback could not be "
+                    "completed. The transaction will be recovered on restart."
+                ) from rollback_exc
+            raise
+        else:
+            self._finish_mutation_transaction()
+
+    @contextmanager
+    def _locked_mutation(self):
+        with self._store_lock():
+            state = self._load_state()
+            with self._mutation_transaction():
+                yield state
+
+    def _begin_mutation_transaction(self):
+        if self.transaction_root.exists():
+            raise SyncError(
+                "A previous sync transaction is pending recovery. Restart the server "
+                "before accepting another mutation."
+            )
+
+        temporary_root = Path(
+            tempfile.mkdtemp(prefix=".sync-transaction.", dir=self.root)
+        )
+        try:
+            state_exists = self.state_path.exists()
+            if state_exists:
+                atomic_write_bytes(
+                    temporary_root / "state.json",
+                    self.state_path.read_bytes(),
+                )
+
+            database_files = {}
+            for source in self._metadata_database_files():
+                exists = source.exists()
+                database_files[source.name] = exists
+                if exists:
+                    atomic_write_bytes(
+                        temporary_root / source.name,
+                        source.read_bytes(),
+                    )
+
+            manifest = {
+                "schemaVersion": TRANSACTION_SCHEMA_VERSION,
+                "gitHead": self._git_head(),
+                "stateExists": state_exists,
+                "databaseFiles": database_files,
+                "untrackedFiles": sorted(self._untracked_file_paths()),
+            }
+            atomic_write_json(temporary_root / "transaction.json", manifest)
+            os.replace(temporary_root, self.transaction_root)
+            _fsync_directory(self.root)
+        except BaseException:
+            shutil.rmtree(temporary_root, ignore_errors=True)
+            raise
+
+    def _finish_mutation_transaction(self):
+        shutil.rmtree(self.transaction_root)
+        _fsync_directory(self.root)
+
+    def _recover_pending_transaction(self):
+        if not self.transaction_root.exists():
+            return
+        marker = self.transaction_root / "transaction.json"
+        if not marker.exists():
+            shutil.rmtree(self.transaction_root)
+            _fsync_directory(self.root)
+            return
+        self._rollback_pending_transaction()
+
+    def _rollback_pending_transaction(self):
+        marker = self.transaction_root / "transaction.json"
+        try:
+            transaction = json.loads(marker.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise SyncError("Stored sync transaction recovery data is invalid.") from exc
+
+        if transaction.get("schemaVersion") != TRANSACTION_SCHEMA_VERSION:
+            raise SyncError("Stored sync transaction schema is unsupported.")
+
+        git_head = transaction.get("gitHead")
+        if not isinstance(git_head, str) or not git_head:
+            raise SyncError("Stored sync transaction is missing its Git checkpoint.")
+        self._run_git("reset", "--hard", git_head)
+
+        previous_files = set(transaction.get("untrackedFiles") or [])
+        for relative_path in self._untracked_file_paths() - previous_files:
+            path = self.files_root / relative_path
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
+        self._prune_all_empty_storage_directories()
+
+        database_files = transaction.get("databaseFiles") or {}
+        for target in self._metadata_database_files():
+            backup = self.transaction_root / target.name
+            if database_files.get(target.name):
+                if not backup.exists():
+                    raise SyncError(
+                        f"Stored sync transaction is missing '{target.name}'."
+                    )
+                atomic_write_bytes(target, backup.read_bytes())
+            else:
+                try:
+                    target.unlink()
+                except FileNotFoundError:
+                    pass
+
+        if transaction.get("stateExists"):
+            backup = self.transaction_root / "state.json"
+            if not backup.exists():
+                raise SyncError("Stored sync transaction is missing 'state.json'.")
+            atomic_write_bytes(self.state_path, backup.read_bytes())
+        else:
+            try:
+                self.state_path.unlink()
+            except FileNotFoundError:
+                pass
+
+        self._finish_mutation_transaction()
+
+    def _metadata_database_files(self):
+        return (
+            self.metadata_db_path,
+            self.metadata_db_path.with_name(f"{self.metadata_db_path.name}-wal"),
+            self.metadata_db_path.with_name(f"{self.metadata_db_path.name}-shm"),
+        )
+
+    def _untracked_file_paths(self):
+        result = self._run_git_bytes(
+            "ls-files",
+            "--others",
+            "--exclude-standard",
+            "-z",
+        )
+        return {
+            entry.decode("utf-8", errors="surrogateescape")
+            for entry in result.stdout.split(b"\0")
+            if entry
+        }
+
+    def _prune_all_empty_storage_directories(self):
+        directories = [
+            path
+            for path in self.files_root.rglob("*")
+            if path.is_dir()
+            and ".git" not in path.relative_to(self.files_root).parts
+        ]
+        for path in sorted(directories, key=lambda value: len(value.parts), reverse=True):
+            try:
+                path.rmdir()
+            except OSError:
+                pass
 
     def reset_repository(self, user=None):
         with self._store_lock():
@@ -243,6 +420,7 @@ class SyncStore:
 
             self.files_root.mkdir(parents=True, exist_ok=True)
             self._ensure_git_repo(commit_existing=False)
+            self._ensure_git_head()
             self._ensure_metadata_store()
             state = self._initial_state(now)
             if user:
@@ -341,9 +519,8 @@ class SyncStore:
             return payload
 
     def rollback_file(self, relative_path, commit, user=None):
-        with self._store_lock():
+        with self._locked_mutation() as state:
             relative_path = normalize_relative_path(relative_path)
-            state = self._load_state()
             current = state["files"].get(relative_path)
             commit = self._resolve_history_commit(relative_path, commit, current)
             content = self._git_file_content(relative_path, commit, current)
@@ -618,10 +795,7 @@ class SyncStore:
             }
 
     def plan_sync(self, payload, user, connection_info=None):
-        client_id = payload.get("clientId")
-        if not isinstance(client_id, str) or not client_id.strip():
-            raise SyncError("clientId is required.")
-        client_id = client_id.strip()
+        client_id = self._client_id(payload.get("clientId"))
 
         base_revision = self._to_int(payload.get("baseRevision", 0), "baseRevision")
         if "metadata" not in payload:
@@ -685,16 +859,12 @@ class SyncStore:
             }
 
     def sync_file_upload(self, payload, user, connection_info=None):
-        client_id = payload.get("clientId")
-        if not isinstance(client_id, str) or not client_id.strip():
-            raise SyncError("clientId is required.")
-        client_id = client_id.strip()
+        client_id = self._client_id(payload.get("clientId"))
 
         base_revision = self._to_int(payload.get("baseRevision", 0), "baseRevision")
         self._preflight_sync_item(payload, base_revision, kind="file")
 
-        with self._store_lock():
-            state = self._load_state()
+        with self._locked_mutation() as state:
             now = utc_now()
             prepared_metadata = self._prepare_file_metadata_update(state, payload)
             relative_path = normalize_relative_path(payload.get("relativePath"))
@@ -764,16 +934,12 @@ class SyncStore:
             }
 
     def sync_attachment_upload(self, payload, user, connection_info=None):
-        client_id = payload.get("clientId")
-        if not isinstance(client_id, str) or not client_id.strip():
-            raise SyncError("clientId is required.")
-        client_id = client_id.strip()
+        client_id = self._client_id(payload.get("clientId"))
 
         base_revision = self._to_int(payload.get("baseRevision", 0), "baseRevision")
         self._preflight_sync_item(payload, base_revision, kind="attachment")
 
-        with self._store_lock():
-            state = self._load_state()
+        with self._locked_mutation() as state:
             now = utc_now()
             self._preflight_sync_item(
                 payload,
@@ -858,10 +1024,7 @@ class SyncStore:
             }
 
     def sync(self, payload, user, connection_info=None):
-        client_id = payload.get("clientId")
-        if not isinstance(client_id, str) or not client_id.strip():
-            raise SyncError("clientId is required.")
-        client_id = client_id.strip()
+        client_id = self._client_id(payload.get("clientId"))
 
         base_revision = self._to_int(payload.get("baseRevision", 0), "baseRevision")
         files = payload.get("files", [])
@@ -870,6 +1033,7 @@ class SyncStore:
         attachments = payload.get("attachments", [])
         if not isinstance(attachments, list):
             raise SyncError("attachments must be a list.")
+        self._validate_unique_sync_items(files, attachments)
 
         if "metadata" in payload:
             self._metadata_request_body(payload["metadata"], base_revision)
@@ -887,126 +1051,255 @@ class SyncStore:
                     kind="attachment",
                     state=state,
                 )
-            accepted = []
-            conflicts = []
-            accepted_attachments = []
-            attachment_conflicts = []
-            accepted_paths = set()
-            accepted_attachment_paths = set()
-            metadata_result = None
             now = utc_now()
+            deleted_file_paths = self._batch_metadata_delete_paths(
+                state,
+                files,
+                attachment=False,
+            )
+            deleted_attachment_paths = self._batch_metadata_delete_paths(
+                state,
+                attachments,
+                attachment=True,
+            )
 
-            metadata_deleted_file_paths = set()
-            for item in files:
-                if not isinstance(item, dict):
-                    continue
+            preview_state = copy.deepcopy(state)
+            preview = self._sync_batch_items(
+                preview_state,
+                payload,
+                files,
+                attachments,
+                base_revision,
+                now,
+                deleted_file_paths,
+                deleted_attachment_paths,
+                persist=False,
+            )
+            has_conflict = self._batch_has_conflict(preview)
 
-                relative_path = normalize_relative_path(item.get("relativePath"))
-                deleted = self._to_bool(
-                    item.get("deleted"),
-                    f"{relative_path}.deleted",
-                )
-                if not deleted or "lastKnownRevision" not in item:
-                    continue
-
-                current = state["files"].get(relative_path)
-                last_known_revision = self._to_int(
-                    item.get("lastKnownRevision"),
-                    f"{relative_path}.lastKnownRevision",
-                )
-                if current and current.get("revision", 0) == last_known_revision:
-                    metadata_deleted_file_paths.add(relative_path)
-            metadata_deleted_attachment_paths = set()
-            for item in attachments:
-                relative_path = normalize_relative_path(item.get("relativePath"))
-                deleted = self._to_bool(
-                    item.get("deleted"),
-                    f"{relative_path}.deleted",
-                )
-                if not deleted or "lastKnownRevision" not in item:
-                    continue
-                current = state["files"].get(relative_path)
-                last_known_revision = self._to_int(
-                    item.get("lastKnownRevision"),
-                    f"{relative_path}.lastKnownRevision",
-                )
-                if (
-                    current
-                    and self._is_attachment_record(current)
-                    and current.get("revision", 0) == last_known_revision
-                ):
-                    metadata_deleted_attachment_paths.add(relative_path)
-            if "metadata" in payload:
-                metadata_result = self._sync_metadata(
+            if has_conflict:
+                self._record_client(
                     state,
-                    payload["metadata"],
+                    client_id,
+                    user,
+                    payload,
+                    connection_info,
+                    now,
+                    "sync",
+                )
+                state["updatedAt"] = now
+                atomic_write_json(self.state_path, state)
+                metadata_result = self._batch_skipped_metadata(
+                    preview["metadata"],
+                    state,
+                )
+                return self._batch_response(
+                    state,
                     base_revision,
                     now,
-                    allowed_removed_file_paths=metadata_deleted_file_paths,
-                    allowed_removed_attachment_paths=(
-                        metadata_deleted_attachment_paths
-                    ),
+                    metadata_result,
+                    accepted=[],
+                    conflicts=preview["conflicts"],
+                    accepted_attachments=[],
+                    attachment_conflicts=preview["attachmentConflicts"],
+                    skipped=preview["accepted"],
+                    skipped_attachments=preview["acceptedAttachments"],
                 )
 
-            for item in files:
-                result = self._sync_file(state, item, base_revision, now)
-                if result["status"] == "conflict":
-                    conflicts.append(result)
-                else:
-                    accepted.append(result)
-                    accepted_paths.add(result["relativePath"])
+            with self._mutation_transaction():
+                applied = self._sync_batch_items(
+                    state,
+                    payload,
+                    files,
+                    attachments,
+                    base_revision,
+                    now,
+                    deleted_file_paths,
+                    deleted_attachment_paths,
+                    persist=True,
+                )
+                if self._batch_has_conflict(applied):
+                    raise SyncError(
+                        "Sync state changed unexpectedly after batch preflight."
+                    )
+                self._record_client(
+                    state,
+                    client_id,
+                    user,
+                    payload,
+                    connection_info,
+                    now,
+                    "sync",
+                )
+                state["updatedAt"] = now
+                atomic_write_json(self.state_path, state)
+                return self._batch_response(
+                    state,
+                    base_revision,
+                    now,
+                    applied["metadata"],
+                    accepted=applied["accepted"],
+                    conflicts=[],
+                    accepted_attachments=applied["acceptedAttachments"],
+                    attachment_conflicts=[],
+                )
 
-            for item in attachments:
-                result = self._sync_attachment(state, item, base_revision, now)
-                if result["status"] == "conflict":
-                    attachment_conflicts.append(result)
-                else:
-                    accepted_attachments.append(result)
-                    accepted_attachment_paths.add(result["relativePath"])
-
-            self._record_client(
-                state,
-                client_id,
-                user,
-                payload,
-                connection_info,
-                now,
-                "sync",
+    def _batch_metadata_delete_paths(self, state, items, attachment):
+        deleted_paths = set()
+        for item in items:
+            relative_path = normalize_relative_path(item.get("relativePath"))
+            deleted = self._to_bool(
+                item.get("deleted"),
+                f"{relative_path}.deleted",
             )
-            state["updatedAt"] = now
-            atomic_write_json(self.state_path, state)
+            if not deleted or "lastKnownRevision" not in item:
+                continue
+            current = state["files"].get(relative_path)
+            last_known_revision = self._to_int(
+                item.get("lastKnownRevision"),
+                f"{relative_path}.lastKnownRevision",
+            )
+            if not current or current.get("revision", 0) != last_known_revision:
+                continue
+            if attachment != self._is_attachment_record(current):
+                continue
+            deleted_paths.add(relative_path)
+        return deleted_paths
 
-            remote_changes = self._remote_changes_since(
+    def _sync_batch_items(
+        self,
+        state,
+        payload,
+        files,
+        attachments,
+        base_revision,
+        now,
+        deleted_file_paths,
+        deleted_attachment_paths,
+        persist,
+    ):
+        metadata_result = None
+        if "metadata" in payload:
+            metadata_result = self._sync_metadata(
+                state,
+                payload["metadata"],
+                base_revision,
+                now,
+                allowed_removed_file_paths=deleted_file_paths,
+                allowed_removed_attachment_paths=deleted_attachment_paths,
+                persist=persist,
+            )
+
+        accepted = []
+        conflicts = []
+        for item in files:
+            result = self._sync_file(
+                state,
+                item,
+                base_revision,
+                now,
+                persist=persist,
+            )
+            (conflicts if result["status"] == "conflict" else accepted).append(result)
+
+        accepted_attachments = []
+        attachment_conflicts = []
+        for item in attachments:
+            result = self._sync_attachment(
+                state,
+                item,
+                base_revision,
+                now,
+                persist=persist,
+            )
+            (
+                attachment_conflicts
+                if result["status"] == "conflict"
+                else accepted_attachments
+            ).append(result)
+
+        return {
+            "metadata": metadata_result,
+            "accepted": accepted,
+            "conflicts": conflicts,
+            "acceptedAttachments": accepted_attachments,
+            "attachmentConflicts": attachment_conflicts,
+        }
+
+    def _batch_has_conflict(self, result):
+        return bool(
+            result["conflicts"]
+            or result["attachmentConflicts"]
+            or self._metadata_conflicted(result["metadata"])
+        )
+
+    def _batch_skipped_metadata(self, metadata_result, state):
+        if not metadata_result or metadata_result.get("status") != "accepted":
+            return metadata_result
+        return {
+            "status": "skipped",
+            "reason": "batch_conflict",
+            "previewStatus": "accepted",
+            "revision": state["metadata"].get("revision", 0),
+            "contentHash": state["metadata"].get("contentHash"),
+            "previewRevision": metadata_result.get("revision"),
+            "previewContentHash": metadata_result.get("contentHash"),
+        }
+
+    def _batch_response(
+        self,
+        state,
+        base_revision,
+        now,
+        metadata_result,
+        accepted,
+        conflicts,
+        accepted_attachments,
+        attachment_conflicts,
+        skipped=None,
+        skipped_attachments=None,
+    ):
+        accepted_paths = {item["relativePath"] for item in accepted}
+        accepted_attachment_paths = {
+            item["relativePath"] for item in accepted_attachments
+        }
+        response = {
+            "status": (
+                "conflict"
+                if conflicts
+                or attachment_conflicts
+                or self._metadata_conflicted(metadata_result)
+                or skipped
+                or skipped_attachments
+                or (metadata_result and metadata_result.get("status") == "skipped")
+                else "ok"
+            ),
+            "serverRevision": state["serverRevision"],
+            "syncedAt": now,
+            "metadata": metadata_result,
+            "accepted": accepted,
+            "conflicts": conflicts,
+            "acceptedAttachments": accepted_attachments,
+            "attachmentConflicts": attachment_conflicts,
+            "remoteChanges": self._remote_changes_since(
                 state,
                 base_revision,
                 accepted_paths,
                 attachment=False,
-            )
-            remote_attachment_changes = self._remote_changes_since(
+            ),
+            "remoteAttachmentChanges": self._remote_changes_since(
                 state,
                 base_revision,
                 accepted_attachment_paths,
                 attachment=True,
-            )
-
-            has_conflict = (
-                conflicts
-                or attachment_conflicts
-                or self._metadata_conflicted(metadata_result)
-            )
-            return {
-                "status": "conflict" if has_conflict else "ok",
-                "serverRevision": state["serverRevision"],
-                "syncedAt": now,
-                "metadata": metadata_result,
-                "accepted": accepted,
-                "conflicts": conflicts,
-                "acceptedAttachments": accepted_attachments,
-                "attachmentConflicts": attachment_conflicts,
-                "remoteChanges": remote_changes,
-                "remoteAttachmentChanges": remote_attachment_changes,
-                "manifest": self._manifest_from_state(state),
-            }
+            ),
+            "manifest": self._manifest_from_state(state),
+        }
+        if skipped is not None:
+            response["skipped"] = skipped
+        if skipped_attachments is not None:
+            response["skippedAttachments"] = skipped_attachments
+        return response
 
     def _record_client(
         self,
@@ -1044,26 +1337,67 @@ class SyncStore:
 
         clients[client_id] = record
 
-    def _clean_mapping(self, value):
-        if not isinstance(value, dict):
+        overflow = len(clients) - MAX_TRACKED_CLIENTS
+        if overflow > 0:
+            stale_client_ids = sorted(
+                (
+                    candidate_id
+                    for candidate_id in clients
+                    if candidate_id != client_id
+                ),
+                key=lambda candidate_id: (
+                    str(clients[candidate_id].get("lastSeenAt") or ""),
+                    candidate_id,
+                ),
+            )
+            for stale_client_id in stale_client_ids[:overflow]:
+                clients.pop(stale_client_id, None)
+
+    def _client_id(self, value):
+        if not isinstance(value, str) or not value.strip():
+            raise SyncError("clientId is required.")
+        client_id = value.strip()
+        if len(client_id) > MAX_CLIENT_ID_LENGTH:
+            raise SyncError(
+                f"clientId must be at most {MAX_CLIENT_ID_LENGTH} characters."
+            )
+        if CONTROL_RE.search(client_id):
+            raise SyncError("clientId cannot contain control characters.")
+        return client_id
+
+    def _clean_mapping(self, value, depth=0):
+        if not isinstance(value, dict) or depth >= MAX_CLIENT_INFO_DEPTH:
             return None
 
         cleaned = {}
-        for key, item in value.items():
+        for key, item in list(value.items())[:MAX_CLIENT_INFO_KEYS]:
             if not isinstance(key, str) or not key.strip():
                 continue
-
-            if isinstance(item, dict):
-                item = self._clean_mapping(item)
-            elif isinstance(item, list):
-                item = [entry for entry in item if entry is not None and entry != ""]
-            elif item is None or item == "":
+            item = self._clean_client_info_value(item, depth + 1)
+            if item is None or item == "" or item == [] or item == {}:
                 continue
-
-            if item is not None and item != []:
-                cleaned[key.strip()] = item
+            cleaned[key.strip()[:MAX_CLIENT_INFO_STRING_LENGTH]] = item
 
         return cleaned or None
+
+    def _clean_client_info_value(self, value, depth):
+        if value is None or depth > MAX_CLIENT_INFO_DEPTH:
+            return None
+        if isinstance(value, str):
+            value = value.strip()
+            return value[:MAX_CLIENT_INFO_STRING_LENGTH] if value else None
+        if isinstance(value, dict):
+            return self._clean_mapping(value, depth)
+        if isinstance(value, list):
+            cleaned = []
+            for entry in value[:MAX_CLIENT_INFO_LIST_ITEMS]:
+                next_entry = self._clean_client_info_value(entry, depth + 1)
+                if next_entry is not None and next_entry not in ("", [], {}):
+                    cleaned.append(next_entry)
+            return cleaned or None
+        if isinstance(value, (bool, int, float)):
+            return value
+        return str(value)[:MAX_CLIENT_INFO_STRING_LENGTH]
 
     def _sync_metadata(
         self,
@@ -1073,6 +1407,7 @@ class SyncStore:
         now,
         allowed_removed_file_paths=None,
         allowed_removed_attachment_paths=None,
+        persist=True,
     ):
         if metadata_payload is None:
             return None
@@ -1087,7 +1422,7 @@ class SyncStore:
 
         current = state["metadata"]
         if (
-            current.get("revision", 0) > last_known_revision
+            current.get("revision", 0) != last_known_revision
             and current.get("contentHash") != content_hash
         ):
             return {
@@ -1135,7 +1470,8 @@ class SyncStore:
             }
 
         state["serverRevision"] += 1
-        self._write_metadata_body(body)
+        if persist:
+            self._write_metadata_body(body)
         state["metadata"] = {
             "revision": state["serverRevision"],
             "contentHash": content_hash,
@@ -1147,7 +1483,7 @@ class SyncStore:
             "contentHash": content_hash,
         }
 
-    def _sync_file(self, state, item, base_revision, now):
+    def _sync_file(self, state, item, base_revision, now, persist=True):
         return self._sync_file_item(
             state,
             item,
@@ -1155,6 +1491,7 @@ class SyncStore:
             now,
             kind="file",
             allow_hash_only=False,
+            persist=persist,
         )
 
     def _preflight_sync_item(self, item, base_revision, kind, state=None):
@@ -1241,7 +1578,7 @@ class SyncStore:
         if declared_hash and declared_hash != content_hash:
             raise SyncError(f"{relative_path}.contentHash does not match content.")
 
-    def _sync_attachment(self, state, item, base_revision, now):
+    def _sync_attachment(self, state, item, base_revision, now, persist=True):
         return self._sync_file_item(
             state,
             item,
@@ -1249,6 +1586,7 @@ class SyncStore:
             now,
             kind="attachment",
             allow_hash_only=True,
+            persist=persist,
         )
 
     def _sync_file_item(
@@ -1259,6 +1597,7 @@ class SyncStore:
         now,
         kind,
         allow_hash_only=False,
+        persist=True,
     ):
         if not isinstance(item, dict):
             raise SyncError("Each file sync item must be an object.")
@@ -1322,7 +1661,7 @@ class SyncStore:
 
         if (
             current
-            and current_revision > last_known_revision
+            and current_revision != last_known_revision
             and not self._same_file_state(current, deleted, content_hash)
         ):
             return {
@@ -1357,14 +1696,16 @@ class SyncStore:
                 }
 
             file_path = self._file_path(relative_path, current)
-            if file_path.exists():
+            if persist and file_path.exists():
                 file_path.unlink()
             state["serverRevision"] += 1
-            git_commit = self._commit_file_change(
-                relative_path,
-                f"Delete {relative_path}",
-                storage_path=current_storage_path,
-            )
+            git_commit = current.get("gitCommit")
+            if persist:
+                git_commit = self._commit_file_change(
+                    relative_path,
+                    f"Delete {relative_path}",
+                    storage_path=current_storage_path,
+                )
             next_record = {
                 "revision": state["serverRevision"],
                 "storagePath": current_storage_path,
@@ -1421,17 +1762,20 @@ class SyncStore:
                         f"Stored file for '{relative_path}' does not exist at "
                         f"'{current_storage_path}'."
                     )
-                self._move_storage_file_if_needed(
-                    current_storage_path,
-                    next_storage_path,
-                )
+                if persist:
+                    self._move_storage_file_if_needed(
+                        current_storage_path,
+                        next_storage_path,
+                    )
                 state["serverRevision"] += 1
-                git_commit = self._commit_file_change(
-                    relative_path,
-                    f"Move {relative_path}",
-                    storage_path=next_storage_path,
-                    previous_storage_path=current_storage_path,
-                )
+                git_commit = current.get("gitCommit")
+                if persist:
+                    git_commit = self._commit_file_change(
+                        relative_path,
+                        f"Move {relative_path}",
+                        storage_path=next_storage_path,
+                        previous_storage_path=current_storage_path,
+                    )
                 next_record = copy.deepcopy(current)
                 next_record.update(
                     {
@@ -1489,22 +1833,25 @@ class SyncStore:
                 kind,
                 current=current,
             )
-            if current_storage_path:
-                self._move_storage_file_if_needed(
-                    current_storage_path,
-                    next_storage_path,
+            if persist:
+                if current_storage_path:
+                    self._move_storage_file_if_needed(
+                        current_storage_path,
+                        next_storage_path,
+                    )
+                atomic_write_bytes(
+                    self._file_path(relative_path, storage_path=next_storage_path),
+                    content,
                 )
-            atomic_write_bytes(
-                self._file_path(relative_path, storage_path=next_storage_path),
-                content,
-            )
             state["serverRevision"] += 1
-            git_commit = self._commit_file_change(
-                relative_path,
-                f"Update {relative_path}",
-                storage_path=next_storage_path,
-                previous_storage_path=current_storage_path,
-            )
+            git_commit = current.get("gitCommit") if current else None
+            if persist:
+                git_commit = self._commit_file_change(
+                    relative_path,
+                    f"Update {relative_path}",
+                    storage_path=next_storage_path,
+                    previous_storage_path=current_storage_path,
+                )
         else:
             next_storage_path = current_storage_path
             git_commit = current.get("gitCommit")
@@ -1625,10 +1972,26 @@ class SyncStore:
     def _record_history_fields(self, record):
         if not isinstance(record, dict):
             return {}
+        result = {}
         snapshots = record.get("metadataSnapshots")
-        if not isinstance(snapshots, dict):
-            return {}
-        return {"metadataSnapshots": copy.deepcopy(snapshots)}
+        if isinstance(snapshots, dict):
+            result["metadataSnapshots"] = copy.deepcopy(snapshots)
+
+        content_hashes = [
+            value
+            for value in record.get("contentHashHistory", [])
+            if isinstance(value, str) and value
+        ]
+        current_hash = record.get("contentHash")
+        if isinstance(current_hash, str) and current_hash:
+            content_hashes.append(current_hash)
+        deduplicated = []
+        for content_hash in content_hashes:
+            if content_hash not in deduplicated:
+                deduplicated.append(content_hash)
+        if deduplicated:
+            result["contentHashHistory"] = deduplicated[-MAX_CONTENT_HASH_HISTORY:]
+        return result
 
     def _metadata_snapshot_for_commit(self, record, commit):
         if not isinstance(record, dict):
@@ -1822,8 +2185,12 @@ class SyncStore:
             if value is not None
         }
 
-    def _attachment_content_from_history(self, relative_path, content_hash=None):
-        record = self._load_state()["files"].get(relative_path)
+    def _attachment_content_from_history(
+        self,
+        relative_path,
+        content_hash=None,
+        record=None,
+    ):
         for item in self._git_history(relative_path, record):
             if item.get("deleted"):
                 continue
@@ -1869,6 +2236,7 @@ class SyncStore:
             content, source_commit = self._attachment_content_from_history(
                 relative_path,
                 target_hash,
+                record=current,
             )
             if content is None:
                 continue
@@ -2676,6 +3044,11 @@ class SyncStore:
             if not isinstance(item, dict):
                 raise SyncError(f"Each {field_name} item must be an object.")
             relative_path = normalize_relative_path(item.get("relativePath"))
+            if relative_path in by_path:
+                raise SyncError(
+                    f"{field_name} contains duplicate relativePath "
+                    f"'{relative_path}'."
+                )
             deleted = self._to_bool(item.get("deleted"), f"{relative_path}.deleted")
             by_path[relative_path] = {
                 "lastKnownRevision": self._to_int(
@@ -2687,6 +3060,23 @@ class SyncStore:
                 "deleted": deleted,
             }
         return by_path
+
+    def _validate_unique_sync_items(self, files, attachments):
+        paths = {}
+        for kind, items in (("files", files), ("attachments", attachments)):
+            for index, item in enumerate(items):
+                if not isinstance(item, dict):
+                    raise SyncError(f"Each {kind} item must be an object.")
+                relative_path = normalize_relative_path(item.get("relativePath"))
+                previous = paths.get(relative_path)
+                if previous is not None:
+                    previous_kind, previous_index = previous
+                    raise SyncError(
+                        f"Sync payload contains duplicate relativePath "
+                        f"'{relative_path}' in {previous_kind}[{previous_index}] "
+                        f"and {kind}[{index}]."
+                    )
+                paths[relative_path] = (kind, index)
 
     def _build_sync_plan(
         self,
@@ -2907,6 +3297,41 @@ class SyncStore:
                         )
                     )
                     continue
+
+            known_hash = known.get("contentHash")
+            if (
+                record
+                and known_hash
+                and server_revision > last_known_revision
+                and record.get("contentHash") != known_hash
+            ):
+                if self._known_content_is_server_ancestor(
+                    relative_path,
+                    record,
+                    known_hash,
+                ):
+                    plan["downloadFiles"].append(
+                        self._download_plan_item(
+                            relative_path,
+                            "server_file_changed",
+                            server_note,
+                            record,
+                            server_workspaces,
+                        )
+                    )
+                else:
+                    plan["conflicts"].append(
+                        self._conflict_plan_item(
+                            relative_path,
+                            "both_sides_changed",
+                            client_note,
+                            server_note,
+                            record,
+                            client_workspaces,
+                            server_workspaces,
+                        )
+                    )
+                continue
 
             if client_updated is not None and server_updated is not None:
                 if client_updated > server_updated:
@@ -3211,6 +3636,32 @@ class SyncStore:
                 known_hash and client_hash and known_hash != client_hash
             )
 
+            if server_changed and known_hash:
+                if self._known_content_is_server_ancestor(
+                    relative_path,
+                    record,
+                    known_hash,
+                ):
+                    plan["downloadAttachments"].append(
+                        self._attachment_download_plan_item(
+                            relative_path,
+                            "server_attachment_changed",
+                            server_entry,
+                            record,
+                        )
+                    )
+                else:
+                    plan["conflicts"].append(
+                        self._attachment_conflict_plan_item(
+                            relative_path,
+                            "both_sides_changed",
+                            client_entry,
+                            server_entry,
+                            record,
+                        )
+                    )
+                continue
+
             if server_changed and client_changed:
                 plan["conflicts"].append(
                     self._attachment_conflict_plan_item(
@@ -3300,6 +3751,44 @@ class SyncStore:
         if known_hash:
             return record.get("contentHash") != known_hash
         return True
+
+    def _known_content_is_server_ancestor(
+        self,
+        relative_path,
+        record,
+        known_hash,
+    ):
+        if not known_hash:
+            return False
+        if record.get("contentHash") == known_hash:
+            return True
+
+        history = [
+            value
+            for value in record.get("contentHashHistory", [])
+            if isinstance(value, str) and value
+        ]
+        if known_hash in history:
+            return True
+
+        discovered = []
+        matched = False
+        for item in self._git_history(relative_path, record):
+            content_hash = item.get("contentHash")
+            if not content_hash:
+                continue
+            if content_hash == known_hash:
+                matched = True
+            if content_hash not in discovered:
+                discovered.append(content_hash)
+
+        merged = []
+        for content_hash in history + list(reversed(discovered)):
+            if content_hash not in merged:
+                merged.append(content_hash)
+        if merged:
+            record["contentHashHistory"] = merged[-MAX_CONTENT_HASH_HISTORY:]
+        return matched
 
     def _metadata_plan_result(
         self,
@@ -4495,6 +4984,16 @@ class SyncStore:
         self._run_git("config", "core.quotePath", "false")
         if commit_existing:
             self._commit_existing_files_if_needed()
+
+    def _ensure_git_head(self):
+        if self._has_git_head():
+            return
+        self._run_git(
+            "commit",
+            "--allow-empty",
+            "-m",
+            "Initialize Notedown file history",
+        )
 
     def _commit_existing_files_if_needed(self):
         if self._has_git_head():

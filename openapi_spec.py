@@ -3,10 +3,10 @@ def build_openapi_spec(server_url):
         "openapi": "3.1.0",
         "info": {
             "title": "Notedown Sync Server API",
-            "version": "1.0.1",
+            "version": "1.1.0",
             "description": (
                 "Markdown note metadata and file synchronization API with "
-                "revision-based conflict detection."
+                "revision-based conflict detection and durable mutation recovery."
             ),
         },
         "servers": [{"url": server_url}],
@@ -489,6 +489,9 @@ def build_openapi_spec(server_url):
                         "Missing client metadata is treated as a download target unless "
                         "knownFiles or knownAttachments explicitly marks that path as "
                         "deleted. "
+                        "When both sides differ, the server checks the known content "
+                        "hash against its Git-backed content ancestry instead of "
+                        "trusting device clock order. "
                         "Clients should include note attachment metadata with "
                         "SHA-256 contentHash values so the server can skip unchanged "
                         "attachment uploads before content transfer."
@@ -711,9 +714,14 @@ def build_openapi_spec(server_url):
                     "description": (
                         "Backward-compatible batch endpoint. New clients should "
                         "prefer /api/sync/plan and /api/sync/file. "
+                        "Batch writes are all-or-nothing when any metadata, file, or "
+                        "attachment conflict is found: accepted remains empty and "
+                        "non-conflicting preview results are returned under skipped "
+                        "or skippedAttachments. Duplicate relativePath entries are "
+                        "rejected before any write. "
                         "The client sends the last server revision it has seen. "
-                        "If the server-side file revision is newer than the "
-                        "client's lastKnownRevision and content differs, the "
+                        "If the server-side file revision does not exactly match "
+                        "the client's lastKnownRevision and content differs, the "
                         "server returns a conflict instead of overwriting data. "
                         "New clients should use /api/sync/attachment for note "
                         "attachments so checksum-only metadata updates can skip "
@@ -1372,7 +1380,11 @@ def build_openapi_spec(server_url):
                     "type": "object",
                     "required": ["clientId", "metadata"],
                     "properties": {
-                        "clientId": {"type": "string", "example": "macbook-1"},
+                        "clientId": {
+                            "type": "string",
+                            "maxLength": 256,
+                            "example": "macbook-1",
+                        },
                         "baseRevision": {"type": "integer", "minimum": 0, "default": 0},
                         "clientInfo": {"$ref": "#/components/schemas/ClientInfo"},
                         "metadata": {"$ref": "#/components/schemas/MetadataSyncRequest"},
@@ -1405,7 +1417,11 @@ def build_openapi_spec(server_url):
                     "type": "object",
                     "required": ["clientId", "relativePath"],
                     "properties": {
-                        "clientId": {"type": "string", "example": "macbook-1"},
+                        "clientId": {
+                            "type": "string",
+                            "maxLength": 256,
+                            "example": "macbook-1",
+                        },
                         "baseRevision": {"type": "integer", "minimum": 0, "default": 0},
                         "clientInfo": {"$ref": "#/components/schemas/ClientInfo"},
                         "relativePath": {"type": "string", "example": "memo/note.md"},
@@ -1449,6 +1465,7 @@ def build_openapi_spec(server_url):
                             "properties": {
                                 "clientId": {
                                     "type": "string",
+                                    "maxLength": 256,
                                     "example": "macbook-1",
                                 },
                                 "baseRevision": {
@@ -1468,7 +1485,11 @@ def build_openapi_spec(server_url):
                     "type": "object",
                     "required": ["clientId"],
                     "properties": {
-                        "clientId": {"type": "string", "example": "macbook-1"},
+                        "clientId": {
+                            "type": "string",
+                            "maxLength": 256,
+                            "example": "macbook-1",
+                        },
                         "baseRevision": {"type": "integer", "minimum": 0, "default": 0},
                         "clientInfo": {"$ref": "#/components/schemas/ClientInfo"},
                         "metadata": {"$ref": "#/components/schemas/MetadataSyncRequest"},
@@ -1492,10 +1513,19 @@ def build_openapi_spec(server_url):
                     "properties": {
                         "status": {
                             "type": "string",
-                            "enum": ["accepted", "unchanged", "conflict"],
+                            "enum": [
+                                "accepted",
+                                "unchanged",
+                                "conflict",
+                                "skipped",
+                            ],
                         },
                         "revision": {"type": "integer"},
                         "contentHash": {"type": ["string", "null"]},
+                        "reason": {"type": "string"},
+                        "previewStatus": {"type": "string"},
+                        "previewRevision": {"type": "integer"},
+                        "previewContentHash": {"type": ["string", "null"]},
                         "serverMetadata": {
                             "type": ["object", "null"],
                             "additionalProperties": True,
@@ -1876,6 +1906,10 @@ def build_openapi_spec(server_url):
                         },
                         "clients": {
                             "type": "object",
+                            "description": (
+                                "Most recently seen sync clients, capped at 128 "
+                                "records to keep state and response sizes bounded."
+                            ),
                             "additionalProperties": {
                                 "$ref": "#/components/schemas/ClientRecord"
                             },
@@ -1917,6 +1951,22 @@ def build_openapi_spec(server_url):
                         "attachmentConflicts": {
                             "type": "array",
                             "items": {"$ref": "#/components/schemas/ConflictFileResult"},
+                        },
+                        "skipped": {
+                            "type": "array",
+                            "description": (
+                                "Non-conflicting file results that were deliberately "
+                                "not written because another batch item conflicted."
+                            ),
+                            "items": {"$ref": "#/components/schemas/AcceptedFileResult"},
+                        },
+                        "skippedAttachments": {
+                            "type": "array",
+                            "description": (
+                                "Non-conflicting attachment results that were not "
+                                "written because another batch item conflicted."
+                            ),
+                            "items": {"$ref": "#/components/schemas/AcceptedFileResult"},
                         },
                         "remoteChanges": {
                             "type": "array",

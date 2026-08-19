@@ -1,5 +1,13 @@
 FROM python:3.14-slim
 
+ARG VERSION=dev
+ARG VCS_REF=unknown
+
+LABEL org.opencontainers.image.title="Notedown Sync Server" \
+    org.opencontainers.image.version="${VERSION}" \
+    org.opencontainers.image.revision="${VCS_REF}" \
+    org.opencontainers.image.source="https://github.com/ImuruKevol/notedown-server"
+
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PORT=5500 \

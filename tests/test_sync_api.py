@@ -5,9 +5,18 @@ import os
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest import mock
 
+import sync_store
 from app import create_app
-from sync_store import atomic_write_bytes, sha256_json
+from sync_store import (
+    MAX_CLIENT_INFO_LIST_ITEMS,
+    MAX_CLIENT_INFO_STRING_LENGTH,
+    MAX_TRACKED_CLIENTS,
+    SyncStore,
+    atomic_write_bytes,
+    sha256_json,
+)
 
 
 class SyncApiTest(unittest.TestCase):
@@ -1373,6 +1382,179 @@ class SyncApiTest(unittest.TestCase):
         self.assertEqual(self.decoded_content(a_file_after_b_save), note_content_b)
         self.assertEqual(base64.b64decode(a_extra_attachment["content"]), extra_content)
 
+    def test_plan_uses_content_ancestry_instead_of_device_clock_order(self):
+        initial_file = "initial file"
+        server_file = "server changed with a future clock"
+        local_file = "local changed with a past clock"
+        initial_attachment_content = b"initial attachment"
+        server_attachment_content = b"server attachment changed"
+        local_attachment_content = b"local attachment changed"
+        initial_attachment_hash = hashlib.sha256(
+            initial_attachment_content
+        ).hexdigest()
+        server_attachment_hash = hashlib.sha256(
+            server_attachment_content
+        ).hexdigest()
+        local_attachment_hash = hashlib.sha256(
+            local_attachment_content
+        ).hexdigest()
+
+        initial_metadata = self.note_metadata(updated_at_ms=100)
+        initial_attachment = self.attachment_metadata(initial_attachment_content)
+        initial_metadata["notes"][0]["attachments"] = [initial_attachment]
+        initial_file_upload = self.client.post(
+            "/api/sync/file",
+            headers=self.headers,
+            json={
+                "clientId": "device-a",
+                "relativePath": "memo/note.md",
+                "lastKnownRevision": 0,
+                "contentEncoding": "utf-8",
+                "content": initial_file,
+                "note": initial_metadata["notes"][0],
+            },
+        ).get_json()
+        initial_attachment_upload = self.client.post(
+            "/api/sync/attachment",
+            headers=self.headers,
+            json={
+                "clientId": "device-a",
+                "noteRelativePath": "memo/note.md",
+                "relativePath": initial_attachment["relativePath"],
+                "lastKnownRevision": 0,
+                "contentEncoding": "base64",
+                "content": base64.b64encode(initial_attachment_content).decode("ascii"),
+                "contentHash": initial_attachment_hash,
+                "note": initial_metadata["notes"][0],
+                "attachment": initial_attachment,
+            },
+        ).get_json()
+
+        server_metadata = self.note_metadata(updated_at_ms=10_000)
+        server_attachment = dict(
+            initial_attachment,
+            contentHash=server_attachment_hash,
+            size=len(server_attachment_content),
+            updatedAtMs=10_000,
+        )
+        server_metadata["notes"][0].update(
+            {"title": "Server future clock", "attachments": [server_attachment]}
+        )
+        server_file_upload = self.client.post(
+            "/api/sync/file",
+            headers=self.headers,
+            json={
+                "clientId": "device-b",
+                "relativePath": "memo/note.md",
+                "lastKnownRevision": initial_file_upload["file"]["revision"],
+                "contentEncoding": "utf-8",
+                "content": server_file,
+                "note": server_metadata["notes"][0],
+            },
+        ).get_json()
+        server_attachment_upload = self.client.post(
+            "/api/sync/attachment",
+            headers=self.headers,
+            json={
+                "clientId": "device-b",
+                "noteRelativePath": "memo/note.md",
+                "relativePath": initial_attachment["relativePath"],
+                "lastKnownRevision": initial_attachment_upload["attachment"][
+                    "revision"
+                ],
+                "contentEncoding": "base64",
+                "content": base64.b64encode(server_attachment_content).decode("ascii"),
+                "contentHash": server_attachment_hash,
+                "note": server_metadata["notes"][0],
+                "attachment": server_attachment,
+            },
+        ).get_json()
+        self.assertEqual(server_file_upload["status"], "ok")
+        self.assertEqual(server_attachment_upload["status"], "ok")
+
+        local_metadata = self.note_metadata(updated_at_ms=50)
+        local_attachment = dict(
+            initial_attachment,
+            contentHash=local_attachment_hash,
+            size=len(local_attachment_content),
+            updatedAtMs=50,
+        )
+        local_metadata["notes"][0]["attachments"] = [local_attachment]
+        changed_plan = self.client.post(
+            "/api/sync/plan",
+            headers=self.headers,
+            json={
+                "clientId": "device-a",
+                "metadata": {
+                    "lastKnownRevision": initial_attachment_upload["manifest"][
+                        "metadata"
+                    ]["revision"],
+                    "body": local_metadata,
+                },
+                "knownFiles": [
+                    {
+                        "relativePath": "memo/note.md",
+                        "lastKnownRevision": initial_file_upload["file"]["revision"],
+                        "contentHash": hashlib.sha256(local_file.encode()).hexdigest(),
+                    }
+                ],
+                "knownAttachments": [
+                    {
+                        "relativePath": initial_attachment["relativePath"],
+                        "lastKnownRevision": initial_attachment_upload["attachment"][
+                            "revision"
+                        ],
+                        "contentHash": local_attachment_hash,
+                    }
+                ],
+            },
+        ).get_json()["plan"]
+        self.assertEqual(changed_plan["downloadFiles"], [])
+        self.assertEqual(changed_plan["downloadAttachments"], [])
+        self.assertEqual(
+            {item["relativePath"] for item in changed_plan["conflicts"]},
+            {"memo/note.md", initial_attachment["relativePath"]},
+        )
+
+        stale_plan = self.client.post(
+            "/api/sync/plan",
+            headers=self.headers,
+            json={
+                "clientId": "device-c",
+                "metadata": {
+                    "lastKnownRevision": initial_attachment_upload["manifest"][
+                        "metadata"
+                    ]["revision"],
+                    "body": initial_metadata,
+                },
+                "knownFiles": [
+                    {
+                        "relativePath": "memo/note.md",
+                        "lastKnownRevision": initial_file_upload["file"]["revision"],
+                        "contentHash": hashlib.sha256(initial_file.encode()).hexdigest(),
+                    }
+                ],
+                "knownAttachments": [
+                    {
+                        "relativePath": initial_attachment["relativePath"],
+                        "lastKnownRevision": initial_attachment_upload["attachment"][
+                            "revision"
+                        ],
+                        "contentHash": initial_attachment_hash,
+                    }
+                ],
+            },
+        ).get_json()["plan"]
+        self.assertEqual(stale_plan["conflicts"], [])
+        self.assertEqual(
+            [item["relativePath"] for item in stale_plan["downloadFiles"]],
+            ["memo/note.md"],
+        )
+        self.assertEqual(
+            [item["relativePath"] for item in stale_plan["downloadAttachments"]],
+            [initial_attachment["relativePath"]],
+        )
+
     def test_file_upload_creates_git_history(self):
         first = self.client.post(
             "/api/sync/file",
@@ -1919,6 +2101,65 @@ class SyncApiTest(unittest.TestCase):
                 item.get("relativePath") == "memo/note.md"
                 for item in plan["conflicts"]
             )
+        )
+
+    def test_future_or_global_revision_cannot_bypass_optimistic_locks(self):
+        metadata = self.note_metadata()
+        upload = self.client.post(
+            "/api/sync/file",
+            headers=self.headers,
+            json={
+                "clientId": "device-a",
+                "relativePath": "memo/note.md",
+                "lastKnownRevision": 0,
+                "contentEncoding": "utf-8",
+                "content": "authoritative content",
+                "note": metadata["notes"][0],
+            },
+        ).get_json()
+
+        overwrite = self.client.post(
+            "/api/sync/file",
+            headers=self.headers,
+            json={
+                "clientId": "device-b",
+                "relativePath": "memo/note.md",
+                "lastKnownRevision": upload["serverRevision"] + 100,
+                "contentEncoding": "utf-8",
+                "content": "must not bypass the file revision",
+            },
+        ).get_json()
+
+        self.assertEqual(overwrite["status"], "conflict")
+        self.assertEqual(overwrite["file"]["status"], "conflict")
+        self.assertEqual(
+            overwrite["file"]["serverRevision"],
+            upload["file"]["revision"],
+        )
+        current = self.client.get(
+            "/api/files/memo/note.md",
+            headers=self.headers,
+        ).get_json()
+        self.assertEqual(self.decoded_content(current), "authoritative content")
+
+        changed_metadata = self.note_metadata(updated_at_ms=30)
+        changed_metadata["notes"][0]["title"] = "Must not overwrite"
+        metadata_overwrite = self.client.post(
+            "/api/sync",
+            headers=self.headers,
+            json={
+                "clientId": "device-b",
+                "metadata": {
+                    "lastKnownRevision": upload["serverRevision"] + 100,
+                    "body": changed_metadata,
+                },
+            },
+        ).get_json()
+        self.assertEqual(metadata_overwrite["status"], "conflict")
+        self.assertEqual(metadata_overwrite["metadata"]["status"], "conflict")
+        self.assertEqual(
+            metadata_overwrite["manifest"]["metadata"],
+            upload["manifest"]["metadata"],
         )
 
     def test_manifest_synthesizes_note_title_for_active_file_without_metadata(self):
@@ -2687,6 +2928,242 @@ class SyncApiTest(unittest.TestCase):
         self.assertEqual(manifest["serverRevision"], 0)
         self.assertEqual(manifest["metadata"]["revision"], 0)
         self.assertEqual(manifest["files"], [])
+
+    def test_batch_conflict_skips_all_metadata_and_file_mutations(self):
+        metadata = self.note_metadata()
+        first = self.client.post(
+            "/api/sync/file",
+            headers=self.headers,
+            json={
+                "clientId": "device-a",
+                "relativePath": "memo/note.md",
+                "lastKnownRevision": 0,
+                "contentEncoding": "utf-8",
+                "content": "server version",
+                "note": metadata["notes"][0],
+            },
+        ).get_json()
+        before = first["manifest"]
+
+        next_metadata = self.note_metadata(updated_at_ms=20)
+        next_metadata["notes"].append(
+            {
+                "id": "note-2",
+                "title": "New note",
+                "workspace": "memo",
+                "relativePath": "memo/new.md",
+                "updatedAtMs": 20,
+            }
+        )
+        batch = self.client.post(
+            "/api/sync",
+            headers=self.headers,
+            json={
+                "clientId": "device-b",
+                "metadata": {
+                    "lastKnownRevision": before["metadata"]["revision"],
+                    "body": next_metadata,
+                },
+                "files": [
+                    {
+                        "relativePath": "memo/new.md",
+                        "lastKnownRevision": 0,
+                        "contentEncoding": "utf-8",
+                        "content": "must be skipped",
+                    },
+                    {
+                        "relativePath": "memo/note.md",
+                        "lastKnownRevision": 0,
+                        "contentEncoding": "utf-8",
+                        "content": "stale overwrite",
+                    },
+                ],
+            },
+        ).get_json()
+
+        self.assertEqual(batch["status"], "conflict")
+        self.assertEqual(batch["accepted"], [])
+        self.assertEqual(batch["metadata"]["status"], "skipped")
+        self.assertEqual(batch["metadata"]["reason"], "batch_conflict")
+        self.assertEqual(
+            batch["metadata"]["revision"],
+            before["metadata"]["revision"],
+        )
+        self.assertGreater(
+            batch["metadata"]["previewRevision"],
+            batch["metadata"]["revision"],
+        )
+        self.assertEqual(
+            [item["relativePath"] for item in batch["skipped"]],
+            ["memo/new.md"],
+        )
+        self.assertEqual(batch["manifest"]["serverRevision"], before["serverRevision"])
+        self.assertEqual(batch["manifest"]["metadata"], before["metadata"])
+
+        missing = self.client.get("/api/files/memo/new.md", headers=self.headers)
+        self.assertEqual(missing.status_code, 400)
+        current = self.client.get("/api/files/memo/note.md", headers=self.headers)
+        self.assertEqual(self.decoded_content(current.get_json()), "server version")
+
+    def test_rejects_duplicate_plan_and_batch_paths_before_writes(self):
+        plan = self.client.post(
+            "/api/sync/plan",
+            headers=self.headers,
+            json={
+                "clientId": "client-a",
+                "metadata": {
+                    "lastKnownRevision": 0,
+                    "body": {"version": 1, "workspaces": [], "notes": []},
+                },
+                "knownFiles": [
+                    {"relativePath": "memo/note.md", "lastKnownRevision": 0},
+                    {"relativePath": "memo/note.md", "lastKnownRevision": 0},
+                ],
+            },
+        )
+        self.assertEqual(plan.status_code, 400)
+        self.assertIn("duplicate relativePath", plan.get_json()["message"])
+
+        batch = self.client.post(
+            "/api/sync",
+            headers=self.headers,
+            json={
+                "clientId": "client-a",
+                "files": [
+                    {
+                        "relativePath": "memo/note.md",
+                        "lastKnownRevision": 0,
+                        "contentEncoding": "utf-8",
+                        "content": "first",
+                    },
+                    {
+                        "relativePath": "memo/note.md",
+                        "lastKnownRevision": 0,
+                        "contentEncoding": "utf-8",
+                        "content": "second",
+                    },
+                ],
+            },
+        )
+        self.assertEqual(batch.status_code, 400)
+        self.assertIn("duplicate relativePath", batch.get_json()["message"])
+        manifest = self.client.get("/api/manifest", headers=self.headers).get_json()
+        self.assertEqual(manifest["serverRevision"], 0)
+        self.assertEqual(manifest["files"], [])
+
+    def test_mutation_failure_rolls_back_file_metadata_state_and_allows_retry(self):
+        with TemporaryDirectory() as storage:
+            store = SyncStore(storage)
+            store.initialize()
+            metadata = self.note_metadata()
+            payload = {
+                "clientId": "client-a",
+                "relativePath": "memo/note.md",
+                "lastKnownRevision": 0,
+                "contentEncoding": "utf-8",
+                "content": "transactional content",
+                "note": metadata["notes"][0],
+            }
+            original_atomic_write_json = sync_store.atomic_write_json
+
+            def fail_final_state_write(path, value):
+                if Path(path) == store.state_path:
+                    raise OSError("simulated state write failure")
+                return original_atomic_write_json(path, value)
+
+            with mock.patch(
+                "sync_store.atomic_write_json",
+                side_effect=fail_final_state_write,
+            ):
+                with self.assertRaises(OSError):
+                    store.sync_file_upload(payload, user="tester")
+
+            manifest = store.manifest()
+            self.assertEqual(manifest["serverRevision"], 0)
+            self.assertEqual(manifest["metadata"]["revision"], 0)
+            self.assertEqual(manifest["files"], [])
+            self.assertFalse((Path(storage) / "files/memo/새 노트.md").exists())
+            self.assertFalse(store.transaction_root.exists())
+
+            retry = store.sync_file_upload(payload, user="tester")
+            self.assertEqual(retry["status"], "ok")
+            self.assertEqual(retry["file"]["status"], "accepted")
+
+    def test_initialize_recovers_interrupted_durable_transaction(self):
+        with TemporaryDirectory() as storage:
+            store = SyncStore(storage)
+            store.initialize()
+            state = store._load_state()
+            store._begin_mutation_transaction()
+            result = store._sync_file(
+                state,
+                {
+                    "relativePath": "memo/crash.md",
+                    "lastKnownRevision": 0,
+                    "contentEncoding": "utf-8",
+                    "content": "interrupted write",
+                },
+                base_revision=0,
+                now="2026-08-19T00:00:00Z",
+            )
+            self.assertEqual(result["status"], "accepted")
+            sync_store.atomic_write_json(store.state_path, state)
+            self.assertTrue((Path(storage) / "files/memo/crash.md").exists())
+            self.assertTrue(store.transaction_root.exists())
+
+            recovered_store = SyncStore(storage)
+            recovered_store.initialize()
+            manifest = recovered_store.manifest()
+            self.assertEqual(manifest["serverRevision"], 0)
+            self.assertEqual(manifest["files"], [])
+            self.assertFalse((Path(storage) / "files/memo/crash.md").exists())
+            self.assertFalse(recovered_store.transaction_root.exists())
+
+    def test_client_telemetry_is_bounded_and_sanitized(self):
+        with TemporaryDirectory() as storage:
+            store = SyncStore(storage)
+            state = store._initial_state("2026-08-19T00:00:00Z")
+            for index in range(MAX_TRACKED_CLIENTS + 5):
+                store._record_client(
+                    state,
+                    f"client-{index:03d}",
+                    "tester",
+                    {
+                        "clientInfo": {
+                            "label": "x" * (MAX_CLIENT_INFO_STRING_LENGTH + 50),
+                            "items": list(range(MAX_CLIENT_INFO_LIST_ITEMS + 10)),
+                        }
+                    },
+                    None,
+                    f"2026-08-19T00:{index:03d}:00Z",
+                    "plan",
+                )
+
+            self.assertEqual(len(state["clients"]), MAX_TRACKED_CLIENTS)
+            self.assertNotIn("client-000", state["clients"])
+            latest = state["clients"][f"client-{MAX_TRACKED_CLIENTS + 4:03d}"]
+            self.assertEqual(
+                len(latest["clientInfo"]["label"]),
+                MAX_CLIENT_INFO_STRING_LENGTH,
+            )
+            self.assertEqual(
+                len(latest["clientInfo"]["items"]),
+                MAX_CLIENT_INFO_LIST_ITEMS,
+            )
+
+        too_long = self.client.post(
+            "/api/sync/plan",
+            headers=self.headers,
+            json={
+                "clientId": "x" * 257,
+                "metadata": {
+                    "lastKnownRevision": 0,
+                    "body": {"version": 1, "workspaces": [], "notes": []},
+                },
+            },
+        )
+        self.assertEqual(too_long.status_code, 400)
+        self.assertIn("at most", too_long.get_json()["message"])
 
     def test_openapi_document_and_swagger_ui_are_public(self):
         spec_response = self.client.get("/api/openapi.json")
