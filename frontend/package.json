@@ -1,0 +1,28 @@
+{
+  "name": "notedown-workspace",
+  "version": "2.0.2",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host 127.0.0.1",
+    "build": "vite build",
+    "test:search": "node --test tests/document-search.test.mjs",
+    "test:e2e": "node ../scripts/browser-check.mjs"
+  },
+  "dependencies": {
+    "@monaco-editor/react": "^4.7.0",
+    "dompurify": "^3.2.7",
+    "highlight.js": "^11.11.1",
+    "lucide-react": "^0.468.0",
+    "markdown-it": "^14.1.0",
+    "markdown-it-task-lists": "^2.1.1",
+    "monaco-editor": "^0.52.2",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.58.0",
+    "@vitejs/plugin-react": "^5.0.0",
+    "vite": "^7.0.0"
+  }
+}

@@ -1,0 +1,100 @@
+<!doctype html>
+<html lang="ko">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="theme-color" content="#7165d9" />
+    <title>연결을 기다리는 중 · Notedown</title>
+    <link rel="icon" type="image/svg+xml" href="/icons/favicon.svg" />
+    <style>
+      :root {
+        color-scheme: light;
+        font-family:
+          -apple-system, BlinkMacSystemFont, "Apple SD Gothic Neo",
+          "Noto Sans KR", sans-serif;
+        color: #303448;
+        background: #f7f8fa;
+      }
+      * {
+        box-sizing: border-box;
+      }
+      body {
+        margin: 0;
+        min-height: 100dvh;
+        display: grid;
+        place-items: center;
+        padding: 24px;
+      }
+      main {
+        width: 100%;
+        max-width: 420px;
+        padding: 44px 32px;
+        text-align: center;
+        background: white;
+        border: 1px solid #e9e7f2;
+        border-radius: 20px;
+      }
+      img {
+        width: 64px;
+        height: 64px;
+      }
+      .brand {
+        font-size: 13px;
+        font-weight: 650;
+        color: #7165d9;
+        margin: 15px 0 28px;
+      }
+      h1 {
+        font-size: 23px;
+        letter-spacing: -0.7px;
+        margin: 0 0 14px;
+        word-break: keep-all;
+      }
+      p {
+        color: #767c8e;
+        font-size: 14px;
+        line-height: 1.8;
+        word-break: keep-all;
+      }
+      button {
+        width: 100%;
+        margin-top: 20px;
+        padding: 13px;
+        border: 0;
+        border-radius: 9px;
+        background: #7165d9;
+        color: white;
+        font: inherit;
+        font-size: 14px;
+        cursor: pointer;
+      }
+      button:hover {
+        background: #6154c4;
+      }
+      button:focus-visible {
+        outline: 3px solid #b9b0ec;
+        outline-offset: 3px;
+      }
+      .note {
+        margin: 22px 0 0;
+        font-size: 12px;
+        color: #8b8b9d;
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <img src="/icons/notedown.svg" alt="Notedown" />
+      <div class="brand">나만의 문서 공간</div>
+      <h1>서버에 연결할 수 없어요</h1>
+      <p>인터넷 연결과 서버 상태를 확인한 뒤<br />쓰던 이야기로 돌아오세요.</p>
+      <button
+        type="button"
+        onclick="location.pathname === '/offline.html' ? location.assign('/') : location.reload()"
+      >
+        다시 연결
+      </button>
+      <p class="note">문서 열기와 저장은 연결된 상태에서 이용할 수 있어요.</p>
+    </main>
+  </body>
+</html>

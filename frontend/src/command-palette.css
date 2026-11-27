@@ -1,0 +1,60 @@
+.command-palette {
+  --palette-top: min(14dvh, 120px);
+  width: calc(100% - 32px);
+  max-width: 650px;
+  max-height: calc(100dvh - var(--palette-top) - 24px);
+  margin: var(--palette-top) auto auto;
+  padding: 0;
+  border: 1px solid #dedbea;
+  border-radius: 14px;
+  color: var(--ink);
+  background: #fff;
+  box-shadow: 0 24px 100px #211a3d38;
+  overflow: hidden;
+}
+.command-palette::backdrop { background: #26213a55; backdrop-filter: blur(3px); }
+.palette-content { display: flex; flex-direction: column; max-height: calc(100dvh - var(--palette-top) - 26px); }
+.palette-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 17px 20px 10px; }
+.palette-heading h2 { margin: 0; font-size: 12px; font-weight: 700; }
+.palette-heading > span { font-size: 10px; color: var(--muted); }
+.palette-search { display: flex; align-items: center; gap: 12px; margin: 0 16px 14px; padding: 10px 12px; border: 1px solid #e1ddeb; border-radius: 8px; background: #fcfbff; color: #8372ca; }
+.palette-search:focus-within { border-color: #b8acef; box-shadow: 0 0 0 3px #f2effe; }
+.palette-search input:focus-visible { outline: none; }
+.palette-search input { flex: 1; min-width: 0; border: 0; padding: 0; outline: none; background: transparent; color: var(--ink); font-size: 14px; height: 24px; }
+.palette-search input::placeholder { color: #9290a4; }
+.palette-search > svg { flex-shrink: 0; }
+.palette-dismiss { flex-shrink: 0; border: 0; background: transparent; padding: 2px; color: #77728d; }
+.command-palette kbd { display: inline-flex; align-items: center; justify-content: center; padding: 2px 4px; border: 1px solid #e1ddeb; border-radius: 4px; background: #fff; font: inherit; font-size: 10px; }
+.palette-summary { display: flex; justify-content: space-between; padding: 10px 20px; border-top: 1px solid #efedf5; color: #77728d; font-size: 10px; }
+.palette-results { overflow-y: auto; overscroll-behavior: contain; min-height: 0; max-height: 390px; padding: 0 8px 8px; scroll-padding: 5px; }
+.palette-option { display: flex; align-items: center; gap: 12px; padding: 10px 12px; min-height: 65px; border-radius: 7px; cursor: pointer; border: 1px solid transparent; }
+.palette-option.active { background: #f1eefc; border-color: #e5defb; }
+.palette-file-icon { display: grid; place-items: center; flex-shrink: 0; width: 32px; height: 36px; border: 1px solid #ece8f6; border-radius: 7px; background: #fff; color: #9b88d8; }
+.palette-note { flex: 1; min-width: 0; }
+.palette-note strong { display: block; font-size: 13px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.palette-note > span { display: flex; align-items: center; gap: 5px; margin-top: 5px; color: #817a96; font-size: 10px; }
+.palette-note > span > svg { flex-shrink: 0; }
+.palette-note > span > span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.palette-note mark { color: #6149bf; background: #e9e1ff; border-radius: 2px; font-weight: 700; }
+.palette-option.active mark { background: #ded2fc; }
+.palette-enter { visibility: hidden; flex-shrink: 0; color: #8372ca; }
+.palette-option.active .palette-enter { visibility: visible; }
+.palette-current { flex-shrink: 0; font-size: 9px; color: #878096; }
+.palette-empty { padding: 38px 20px 46px; display: flex; flex-direction: column; align-items: center; gap: 12px; color: #9184bb; text-align: center; }
+.palette-empty strong { color: #565168; font-size: 13px; }
+.palette-empty p { margin: 0; font-size: 11px; color: #817a96; }
+.palette-footer { display: flex; justify-content: space-between; align-items: center; gap: 12px; padding: 12px 18px; border-top: 1px solid #efedf5; background: #faf9fc; font-size: 10px; color: #817a96; }
+.palette-heading, .palette-search, .palette-summary, .palette-footer { flex-shrink: 0; }
+.palette-keys, .palette-keys > span { display: flex; align-items: center; gap: 5px; white-space: nowrap; }
+.palette-keys { gap: 12px; }
+.palette-launch { flex-shrink: 0; }
+.search-shortcut { border: 0; padding: 2px; color: inherit; background: transparent; }
+@media (max-width: 760px) {
+  .command-palette { --palette-top: 24px; }
+  .palette-heading { padding: 14px 14px 10px; }
+  .palette-search { margin: 0 12px 12px; gap: 8px; padding: 10px 8px; }
+  .palette-search input { font-size: 16px; }
+  .palette-option { padding: 9px 8px; gap: 9px; }
+  .palette-footer { flex-wrap: wrap; padding: 10px 14px; gap: 8px; }
+  .palette-current { display: none; }
+}

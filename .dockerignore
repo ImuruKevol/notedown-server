@@ -17,3 +17,11 @@ storage
 Dockerfile
 README.md
 LICENSE
+frontend/node_modules
+frontend/dist
+.verification-data
+.verification-artifacts
+.preview-snapshot
+docs/verification
+screenshots
+tests

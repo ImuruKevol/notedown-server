@@ -1,0 +1,172 @@
+.brand-mark img {
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+.pwa-install-button {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  color: #7165d9;
+  font-size: 12px;
+  border: 1px solid #e4dff6;
+  border-radius: 8px;
+  padding: 10px 14px;
+  background: #faf9ff;
+}
+.pwa-install-button:hover {
+  background: #f0edfc;
+  border-color: #cfc7f0;
+}
+.auth-form .pwa-install-button {
+  width: 100%;
+  margin-top: 22px;
+}
+.topbar-install {
+  min-height: 34px;
+  padding: 6px 10px;
+  font-size: 11px;
+  gap: 6px;
+  white-space: nowrap;
+}
+.pwa-dialog {
+  padding: 0;
+  width: calc(100% - 32px);
+  max-width: 460px;
+  max-height: calc(100dvh - 36px);
+  overflow: auto;
+  border: 1px solid #e8e5f2;
+  border-radius: 18px;
+  color: var(--ink);
+  background: #fff;
+  box-shadow: 0 24px 90px #29213c29;
+}
+.pwa-dialog::backdrop {
+  background: #29243e55;
+  backdrop-filter: blur(4px);
+}
+.pwa-dialog-content {
+  position: relative;
+  padding: 33px;
+}
+.pwa-close {
+  position: absolute;
+  top: 16px;
+  right: 16px;
+}
+.pwa-app-icon {
+  display: block;
+  margin-bottom: 23px;
+}
+.pwa-eyebrow {
+  display: block;
+  font-size: 9px;
+  letter-spacing: 1.5px;
+  font-weight: 650;
+  color: #948aad;
+}
+.pwa-dialog h2 {
+  margin: 10px 0;
+  font-size: 23px;
+  letter-spacing: -0.7px;
+}
+.pwa-description {
+  margin: 0 0 25px;
+  font-size: 13px;
+  color: #808294;
+  line-height: 1.8;
+  word-break: keep-all;
+}
+.pwa-native-install {
+  width: 100%;
+  margin-bottom: 19px;
+}
+.pwa-install-methods {
+  border: 1px solid #ece9f4;
+  border-radius: 10px;
+  background: #fcfbff;
+}
+.pwa-install-methods > div {
+  display: flex;
+  gap: 13px;
+  padding: 15px;
+}
+.pwa-install-methods > div + div {
+  border-top: 1px solid #ece9f4;
+}
+.pwa-install-methods svg {
+  margin-top: 2px;
+  flex-shrink: 0;
+  color: #9784b8;
+}
+.pwa-install-methods p {
+  margin: 0;
+}
+.pwa-install-methods strong {
+  display: block;
+  font-size: 12px;
+  font-weight: 600;
+  margin-bottom: 4px;
+  color: #5d596f;
+}
+.pwa-install-methods span {
+  display: block;
+  font-size: 12px;
+  line-height: 1.75;
+  color: #838193;
+  word-break: keep-all;
+}
+.pwa-online-note {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  margin: 21px 0 0;
+  font-size: 11px;
+  line-height: 1.7;
+  color: #9290a1;
+}
+.pwa-online-note svg {
+  flex-shrink: 0;
+}
+.pwa-connection-note {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  color: #6a6080;
+  background: #f7f4fc;
+  border-radius: 9px;
+  padding: 16px;
+}
+.pwa-connection-note svg {
+  flex-shrink: 0;
+  margin-top: 3px;
+}
+.pwa-connection-note p,
+.pwa-message {
+  margin: 0;
+  font-size: 13px;
+  line-height: 1.8;
+  word-break: keep-all;
+}
+.pwa-message {
+  color: #a35c65;
+  margin-top: 15px;
+}
+@media (max-width: 760px) {
+  .topbar-install {
+    padding: 6px 8px;
+    font-size: 10px;
+  }
+  .pwa-dialog-content {
+    padding: 28px 23px;
+  }
+  .pwa-dialog h2 {
+    font-size: 22px;
+  }
+  .pwa-app-icon {
+    width: 54px;
+    height: 54px;
+    margin-bottom: 19px;
+  }
+}
