@@ -206,7 +206,7 @@ select {
 
 input:focus,
 select:focus {
-  outline: 3px solid rgba(37, 99, 235, 0.16);
+  outline: none;
   border-color: var(--accent);
 }
 

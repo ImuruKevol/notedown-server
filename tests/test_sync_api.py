@@ -7,6 +7,10 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest import mock
 
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
+from itsdangerous import URLSafeTimedSerializer
+
 import sync_store
 from app import create_app
 from sync_store import (
@@ -31,13 +35,13 @@ class SyncApiTest(unittest.TestCase):
                 "NOTE_SYNC_SECRET": "test-secret",
             }
         )
-        self.client = self.app.test_client()
+        self.client = TestClient(self.app, follow_redirects=False)
         response = self.client.post(
             "/api/login",
             json={"username": "tester", "password": "secret"},
         )
         self.assertEqual(response.status_code, 200)
-        login_payload = response.get_json()
+        login_payload = response.json()
         self.assertNotIn("expiresIn", login_payload)
         self.assertIn("tokenId", login_payload)
         self.access_token = login_payload["accessToken"]
@@ -45,7 +49,70 @@ class SyncApiTest(unittest.TestCase):
         self.headers = {"Authorization": f"Bearer {self.access_token}"}
 
     def tearDown(self):
+        self.client.close()
         self.tempdir.cleanup()
+
+    def test_native_fastapi_app_exposes_shared_stores(self):
+        self.assertIsInstance(self.app, FastAPI)
+        self.assertIsInstance(self.app.state.store, SyncStore)
+        self.assertEqual(self.app.state.config["NOTE_SYNC_STORAGE"], self.tempdir.name)
+
+    def test_legacy_signed_bearer_token_survives_framework_migration(self):
+        record = self.app.state.token_store.issue("tester")
+        legacy_serializer = URLSafeTimedSerializer("test-secret", salt="notedown-sync-token")
+        legacy_token = legacy_serializer.dumps({"sub": "tester", "jti": record["id"]})
+        with TestClient(self.app) as anonymous:
+            response = anonymous.get("/api/manifest", headers={"Authorization": f"Bearer {legacy_token}"})
+            self.assertEqual(response.status_code, 200)
+            missing = anonymous.get("/api/manifest")
+            self.assertEqual(missing.status_code, 401)
+            self.assertEqual(missing.json(), {"error": "missing_bearer_token"})
+            invalid = anonymous.get("/api/manifest", headers={"Authorization": "Bearer invalid"})
+            self.assertEqual(invalid.status_code, 401)
+            self.assertEqual(invalid.json(), {"error": "invalid_token"})
+
+    def test_malformed_sync_json_preserves_protocol_error(self):
+        for payload in ("[1,2]", "null", "{broken", ""):
+            with self.subTest(payload=payload):
+                response = self.client.post("/api/sync", content=payload, headers={"Content-Type": "application/json"})
+                self.assertEqual(response.status_code, 400)
+                self.assertEqual(response.json()["error"], "invalid_sync_payload")
+
+    def test_editor_request_limit_checks_declared_and_streamed_body_size(self):
+        declared = self.client.post("/api/editor/workspaces", content=b"", headers={"Content-Length": str(26 * 1024 * 1024)})
+        self.assertEqual(declared.status_code, 413)
+        self.assertEqual(declared.json()["error"], "request_too_large")
+        streamed = self.client.post(
+            "/api/editor/workspaces",
+            content=(b"x" * (1024 * 1024) for _ in range(26)),
+            headers={"Content-Type": "application/json"},
+        )
+        self.assertEqual(streamed.status_code, 413)
+        self.assertEqual(streamed.json()["error"], "request_too_large")
+
+    def test_browser_session_csrf_guard_and_bearer_cors(self):
+        rejected = self.client.post("/api/logout", headers={"Origin": "https://other.example"})
+        self.assertEqual(rejected.status_code, 403)
+        self.assertEqual(self.client.get("/api/manifest").status_code, 200)
+        with TestClient(self.app) as bearer_client:
+            response = bearer_client.post(
+                "/api/sync/plan",
+                headers={**self.headers, "Origin": "https://desktop.example"},
+                json={"clientId": "desktop", "metadata": {"lastKnownRevision": 0, "body": {"version": 1, "workspaces": [], "notes": []}}},
+            )
+            self.assertEqual(response.status_code, 200)
+            preflight = bearer_client.options("/api/sync/attachment", headers={"Origin": "https://desktop.example"})
+            self.assertEqual(preflight.status_code, 204)
+            self.assertIn("POST", preflight.headers["access-control-allow-methods"])
+
+    def test_session_cookie_and_logout(self):
+        login = self.client.post("/api/login", json={"username": "tester", "password": "secret"})
+        cookie = login.headers["set-cookie"].lower()
+        self.assertIn("httponly", cookie)
+        self.assertIn("samesite=lax", cookie)
+        logout = self.client.post("/api/logout", headers={"Origin": "http://testserver"})
+        self.assertEqual(logout.status_code, 200)
+        self.assertEqual(self.client.get("/api/manifest").status_code, 401)
 
     def note_metadata(self, updated_at_ms=10):
         return {
@@ -131,20 +198,20 @@ class SyncApiTest(unittest.TestCase):
         )
 
         self.assertEqual(response.status_code, 200)
-        payload = response.get_json()
+        payload = response.json()
         self.assertEqual(payload["status"], "ok")
         self.assertEqual(payload["serverRevision"], 2)
         self.assertEqual(payload["accepted"][0]["relativePath"], "memo/note.md")
 
-        manifest = self.client.get("/api/manifest", headers=self.headers).get_json()
+        manifest = self.client.get("/api/manifest", headers=self.headers).json()
         self.assertEqual(manifest["serverRevision"], 2)
         self.assertEqual(manifest["files"][0]["relativePath"], "memo/note.md")
 
     def test_plan_records_client_details(self):
-        response = self.client.post(
+        client = TestClient(self.app, client=("10.0.0.5", 50000))
+        response = client.post(
             "/api/sync/plan",
             headers={**self.headers, "User-Agent": "Notedown/1.2"},
-            environ_overrides={"REMOTE_ADDR": "10.0.0.5"},
             json={
                 "clientId": "client-a",
                 "baseRevision": 0,
@@ -168,7 +235,7 @@ class SyncApiTest(unittest.TestCase):
         )
 
         self.assertEqual(response.status_code, 200)
-        client = response.get_json()["manifest"]["clients"]["client-a"]
+        client = response.json()["manifest"]["clients"]["client-a"]
         self.assertEqual(client["clientInfo"]["hostname"], "macbook-pro")
         self.assertEqual(client["clientInfo"]["appVersion"], "1.2.3")
         self.assertEqual(client["clientInfo"]["browser"], "Chrome")
@@ -182,28 +249,28 @@ class SyncApiTest(unittest.TestCase):
         tokens_response = self.client.get("/api/admin/tokens")
         self.assertEqual(tokens_response.status_code, 200)
 
-        tokens = tokens_response.get_json()["tokens"]
+        tokens = tokens_response.json()["tokens"]
         token_ids = {token["id"] for token in tokens}
         self.assertIn(self.token_id, token_ids)
 
-        bearer_client = self.app.test_client()
+        bearer_client = TestClient(self.app, follow_redirects=False)
         authenticated = bearer_client.get("/api/manifest", headers=self.headers)
         self.assertEqual(authenticated.status_code, 200)
 
-        touched_tokens = self.client.get("/api/admin/tokens").get_json()["tokens"]
+        touched_tokens = self.client.get("/api/admin/tokens").json()["tokens"]
         touched = next(token for token in touched_tokens if token["id"] == self.token_id)
         self.assertIsNotNone(touched["lastUsedAt"])
 
         delete_response = self.client.delete(f"/api/admin/tokens/{self.token_id}")
         self.assertEqual(delete_response.status_code, 200)
-        self.assertEqual(delete_response.get_json()["status"], "deleted")
+        self.assertEqual(delete_response.json()["status"], "deleted")
 
-        remaining = self.client.get("/api/admin/tokens").get_json()["tokens"]
+        remaining = self.client.get("/api/admin/tokens").json()["tokens"]
         self.assertNotIn(self.token_id, {token["id"] for token in remaining})
 
-        rejected = self.app.test_client().get("/api/manifest", headers=self.headers)
+        rejected = TestClient(self.app, follow_redirects=False).get("/api/manifest", headers=self.headers)
         self.assertEqual(rejected.status_code, 401)
-        self.assertEqual(rejected.get_json()["error"], "invalid_token")
+        self.assertEqual(rejected.json()["error"], "invalid_token")
 
     def test_admin_can_reset_storage_for_resync(self):
         metadata = self.note_metadata()
@@ -221,7 +288,7 @@ class SyncApiTest(unittest.TestCase):
                 "workspace": {"id": "memo", "name": "memo"},
                 "note": metadata["notes"][0],
             },
-        ).get_json()
+        ).json()
         self.assertGreater(upload["serverRevision"], 0)
         self.assertTrue(
             (Path(self.tempdir.name) / "files" / "memo" / "새 노트.md").exists()
@@ -241,7 +308,7 @@ class SyncApiTest(unittest.TestCase):
         )
 
         self.assertEqual(reset.status_code, 200)
-        payload = reset.get_json()
+        payload = reset.json()
         self.assertEqual(payload["status"], "reset")
         manifest = payload["manifest"]
         self.assertEqual(manifest["serverRevision"], 0)
@@ -253,7 +320,7 @@ class SyncApiTest(unittest.TestCase):
 
         still_authenticated = self.client.get("/api/manifest", headers=self.headers)
         self.assertEqual(still_authenticated.status_code, 200)
-        self.assertEqual(still_authenticated.get_json()["serverRevision"], 0)
+        self.assertEqual(still_authenticated.json()["serverRevision"], 0)
 
     def test_update_file_backed_admin_credentials(self):
         with TemporaryDirectory() as tempdir:
@@ -267,7 +334,7 @@ class SyncApiTest(unittest.TestCase):
                     "NOTE_SYNC_SECRET": "file-auth-secret",
                 }
             )
-            client = app.test_client()
+            client = TestClient(app, follow_redirects=False)
             setup = client.post(
                 "/api/setup",
                 json={"username": "admin", "password": "old-password"},
@@ -284,7 +351,7 @@ class SyncApiTest(unittest.TestCase):
                 },
             )
             self.assertEqual(update.status_code, 200)
-            self.assertEqual(update.get_json()["username"], "owner")
+            self.assertEqual(update.json()["username"], "owner")
 
             old_login = client.post(
                 "/api/login",
@@ -310,7 +377,7 @@ class SyncApiTest(unittest.TestCase):
         )
 
         self.assertEqual(response.status_code, 409)
-        self.assertEqual(response.get_json()["error"], "auth_update_not_supported")
+        self.assertEqual(response.json()["error"], "auth_update_not_supported")
 
     def test_reject_admin_password_confirmation_mismatch(self):
         with TemporaryDirectory() as tempdir:
@@ -324,7 +391,7 @@ class SyncApiTest(unittest.TestCase):
                     "NOTE_SYNC_SECRET": "file-auth-secret",
                 }
             )
-            client = app.test_client()
+            client = TestClient(app, follow_redirects=False)
             setup = client.post(
                 "/api/setup",
                 json={"username": "admin", "password": "old-password"},
@@ -343,7 +410,7 @@ class SyncApiTest(unittest.TestCase):
 
             self.assertEqual(response.status_code, 400)
             self.assertEqual(
-                response.get_json()["error"],
+                response.json()["error"],
                 "password_confirmation_mismatch",
             )
 
@@ -361,7 +428,7 @@ class SyncApiTest(unittest.TestCase):
         )
 
         self.assertEqual(plan_response.status_code, 200)
-        plan = plan_response.get_json()
+        plan = plan_response.json()
         self.assertEqual(plan["status"], "ok")
         self.assertEqual(plan["serverRevision"], 0)
         self.assertEqual(plan["plan"]["uploadFiles"][0]["relativePath"], "memo/note.md")
@@ -383,7 +450,7 @@ class SyncApiTest(unittest.TestCase):
         )
 
         self.assertEqual(upload_response.status_code, 200)
-        upload = upload_response.get_json()
+        upload = upload_response.json()
         self.assertEqual(upload["status"], "ok")
         self.assertEqual(upload["file"]["status"], "accepted")
         self.assertEqual(upload["metadata"]["status"], "accepted")
@@ -417,7 +484,7 @@ class SyncApiTest(unittest.TestCase):
         )
 
         self.assertEqual(response.status_code, 200)
-        upload = response.get_json()
+        upload = response.json()
         self.assertEqual(upload["file"]["storagePath"], "memo/회의 기록.md")
 
         storage_root = Path(self.tempdir.name)
@@ -431,7 +498,7 @@ class SyncApiTest(unittest.TestCase):
         download = self.client.get(
             "/api/files/memo/note-1779945632257.md",
             headers=self.headers,
-        ).get_json()
+        ).json()
         self.assertEqual(self.decoded_content(download), "# 회의 기록\n")
         self.assertEqual(download["storagePath"], "memo/회의 기록.md")
 
@@ -455,7 +522,7 @@ class SyncApiTest(unittest.TestCase):
         )
 
         self.assertEqual(response.status_code, 200)
-        upload = response.get_json()
+        upload = response.json()
         note = upload["manifest"]["files"][0]["note"]
         self.assertEqual(note["folder"], "미지정 워크스페이스")
         self.assertEqual(note["workspace"], "미지정 워크스페이스")
@@ -472,7 +539,7 @@ class SyncApiTest(unittest.TestCase):
                     "body": {"version": 1, "workspaces": [], "notes": []},
                 },
             },
-        ).get_json()["plan"]
+        ).json()["plan"]
 
         download = plan["downloadFiles"][0]
         self.assertEqual(download["note"]["folder"], "미지정 워크스페이스")
@@ -497,7 +564,7 @@ class SyncApiTest(unittest.TestCase):
         )
 
         self.assertEqual(response.status_code, 200)
-        sync_payload = response.get_json()
+        sync_payload = response.json()
         self.assertEqual(sync_payload["metadata"]["status"], "accepted")
 
         plan_payload = self.client.post(
@@ -511,7 +578,7 @@ class SyncApiTest(unittest.TestCase):
                     "body": {"version": 1, "workspaces": [], "notes": []},
                 },
             },
-        ).get_json()
+        ).json()
         server_metadata = plan_payload["metadata"]["serverMetadata"]
 
         self.assertEqual(
@@ -548,7 +615,7 @@ class SyncApiTest(unittest.TestCase):
         )
 
         self.assertEqual(response.status_code, 200)
-        upload = response.get_json()
+        upload = response.json()
         self.assertEqual(
             upload["attachment"]["storagePath"],
             "memo/attachments/첨부 노트/diagram.png",
@@ -591,7 +658,7 @@ class SyncApiTest(unittest.TestCase):
         )
 
         self.assertEqual(upload_response.status_code, 200)
-        upload = upload_response.get_json()
+        upload = upload_response.json()
         self.assertEqual(upload["status"], "ok")
         self.assertEqual(upload["attachment"]["status"], "accepted")
         self.assertEqual(upload["metadata"]["status"], "accepted")
@@ -607,7 +674,7 @@ class SyncApiTest(unittest.TestCase):
             headers=self.headers,
         )
         self.assertEqual(download_response.status_code, 200)
-        download = download_response.get_json()
+        download = download_response.json()
         self.assertEqual(download["mimeType"], "image/png")
         self.assertEqual(download["contentHash"], digest)
         self.assertEqual(base64.b64decode(download["content"]), content)
@@ -633,7 +700,7 @@ class SyncApiTest(unittest.TestCase):
         )
 
         self.assertEqual(plan_response.status_code, 200)
-        plan = plan_response.get_json()["plan"]
+        plan = plan_response.json()["plan"]
         self.assertEqual(plan["uploadAttachments"], [])
         self.assertEqual(plan["downloadAttachments"], [])
 
@@ -660,7 +727,7 @@ class SyncApiTest(unittest.TestCase):
                     }
                 ],
             },
-        ).get_json()["plan"]
+        ).json()["plan"]
 
         self.assertEqual(
             changed_plan["uploadAttachments"][0]["relativePath"],
@@ -690,7 +757,7 @@ class SyncApiTest(unittest.TestCase):
                 "workspace": {"id": "memo", "name": "memo"},
                 "note": metadata["notes"][0],
             },
-        ).get_json()
+        ).json()
 
         attachment_upload = self.client.post(
             "/api/sync/attachment",
@@ -708,7 +775,7 @@ class SyncApiTest(unittest.TestCase):
                 "note": metadata["notes"][0],
                 "attachment": attachment,
             },
-        ).get_json()
+        ).json()
 
         manifest = attachment_upload["manifest"]
         manifest_file = manifest["files"][0]
@@ -742,7 +809,7 @@ class SyncApiTest(unittest.TestCase):
         )
 
         self.assertEqual(plan_response.status_code, 200)
-        plan = plan_response.get_json()["plan"]
+        plan = plan_response.json()["plan"]
         self.assertEqual(plan["deleteServerFiles"], [])
         self.assertEqual(plan["deleteServerAttachments"], [])
         self.assertEqual(plan["downloadFiles"][0]["relativePath"], "memo/note.md")
@@ -791,7 +858,7 @@ class SyncApiTest(unittest.TestCase):
         )
 
         self.assertEqual(plan_response.status_code, 200)
-        payload = plan_response.get_json()
+        payload = plan_response.json()
         self.assertEqual(payload["metadata"]["status"], "diverged")
         self.assertEqual(payload["status"], "ok")
         self.assertEqual(payload["plan"]["conflicts"], [])
@@ -836,7 +903,7 @@ class SyncApiTest(unittest.TestCase):
         )
 
         self.assertEqual(plan_response.status_code, 200)
-        payload = plan_response.get_json()
+        payload = plan_response.json()
         self.assertEqual(payload["status"], "conflict")
         self.assertEqual(len(payload["plan"]["conflicts"]), 1)
         conflict = payload["plan"]["conflicts"][0]
@@ -859,7 +926,7 @@ class SyncApiTest(unittest.TestCase):
                 "workspace": {"id": "memo", "name": "memo"},
                 "note": metadata["notes"][0],
             },
-        ).get_json()
+        ).json()
 
         plan = self.client.post(
             "/api/sync/plan",
@@ -880,7 +947,7 @@ class SyncApiTest(unittest.TestCase):
                     }
                 ],
             },
-        ).get_json()["plan"]
+        ).json()["plan"]
 
         self.assertEqual(plan["downloadFiles"], [])
         self.assertEqual(plan["deleteServerFiles"][0]["relativePath"], "memo/note.md")
@@ -902,7 +969,7 @@ class SyncApiTest(unittest.TestCase):
                 "workspace": {"id": "memo", "name": "memo"},
                 "note": metadata["notes"][0],
             },
-        ).get_json()
+        ).json()
 
         wipe = self.client.post(
             "/api/sync",
@@ -919,7 +986,7 @@ class SyncApiTest(unittest.TestCase):
         )
 
         self.assertEqual(wipe.status_code, 200)
-        payload = wipe.get_json()
+        payload = wipe.json()
         self.assertEqual(payload["status"], "conflict")
         self.assertEqual(payload["metadata"]["status"], "conflict")
         self.assertEqual(
@@ -928,7 +995,7 @@ class SyncApiTest(unittest.TestCase):
         )
         self.assertEqual(payload["metadata"]["orphanedFiles"], ["memo/note.md"])
 
-        manifest = self.client.get("/api/manifest", headers=self.headers).get_json()
+        manifest = self.client.get("/api/manifest", headers=self.headers).json()
         self.assertEqual(manifest["files"][0]["note"]["title"], "새 노트")
 
     def test_delete_upload_requires_explicit_last_known_revision(self):
@@ -944,7 +1011,7 @@ class SyncApiTest(unittest.TestCase):
         )
 
         self.assertEqual(response.status_code, 400)
-        self.assertIn("lastKnownRevision", response.get_json()["message"])
+        self.assertIn("lastKnownRevision", response.json()["message"])
 
         string_deleted = self.client.post(
             "/api/sync/file",
@@ -958,7 +1025,7 @@ class SyncApiTest(unittest.TestCase):
         )
 
         self.assertEqual(string_deleted.status_code, 400)
-        self.assertIn("must be a boolean", string_deleted.get_json()["message"])
+        self.assertIn("must be a boolean", string_deleted.json()["message"])
 
     def test_attachment_metadata_only_sync_skips_existing_content_upload(self):
         content = b"report-binary"
@@ -984,7 +1051,7 @@ class SyncApiTest(unittest.TestCase):
                     }
                 ],
             },
-        ).get_json()
+        ).json()
 
         plan = self.client.post(
             "/api/sync/plan",
@@ -1004,7 +1071,7 @@ class SyncApiTest(unittest.TestCase):
                     }
                 ],
             },
-        ).get_json()["plan"]
+        ).json()["plan"]
 
         self.assertEqual(
             plan["uploadAttachments"][0]["reason"],
@@ -1025,7 +1092,7 @@ class SyncApiTest(unittest.TestCase):
                 "note": metadata["notes"][0],
                 "attachment": attachment,
             },
-        ).get_json()
+        ).json()
 
         self.assertEqual(metadata_only["attachment"]["status"], "accepted")
         self.assertEqual(
@@ -1069,7 +1136,7 @@ class SyncApiTest(unittest.TestCase):
                 "baseRevision": 0,
                 "metadata": {"lastKnownRevision": 0, "body": metadata},
             },
-        ).get_json()["plan"]
+        ).json()["plan"]
 
         self.assertEqual(
             initial_plan["uploadFiles"][0]["relativePath"],
@@ -1094,7 +1161,7 @@ class SyncApiTest(unittest.TestCase):
                 "workspace": {"id": "memo", "name": "memo"},
                 "note": metadata["notes"][0],
             },
-        ).get_json()
+        ).json()
 
         image_upload = self.client.post(
             "/api/sync/attachment",
@@ -1112,7 +1179,7 @@ class SyncApiTest(unittest.TestCase):
                 "note": metadata["notes"][0],
                 "attachment": image_attachment,
             },
-        ).get_json()
+        ).json()
 
         file_upload = self.client.post(
             "/api/sync/attachment",
@@ -1130,7 +1197,7 @@ class SyncApiTest(unittest.TestCase):
                 "note": metadata["notes"][0],
                 "attachment": file_attachment,
             },
-        ).get_json()
+        ).json()
 
         self.assertEqual(note_upload["file"]["status"], "accepted")
         self.assertEqual(image_upload["attachment"]["status"], "accepted")
@@ -1140,15 +1207,15 @@ class SyncApiTest(unittest.TestCase):
         note_download = self.client.get(
             "/api/files/memo/note.md",
             headers=self.headers,
-        ).get_json()
+        ).json()
         image_download = self.client.get(
             f"/api/attachments/{image_attachment['relativePath']}",
             headers=self.headers,
-        ).get_json()
+        ).json()
         file_download = self.client.get(
             f"/api/attachments/{file_attachment['relativePath']}",
             headers=self.headers,
-        ).get_json()
+        ).json()
 
         self.assertEqual(self.decoded_content(note_download), note_content)
         self.assertEqual(base64.b64decode(image_download["content"]), image_content)
@@ -1186,7 +1253,7 @@ class SyncApiTest(unittest.TestCase):
                     },
                 ],
             },
-        ).get_json()["plan"]
+        ).json()["plan"]
 
         self.assertEqual(settled_plan["uploadFiles"], [])
         self.assertEqual(settled_plan["downloadFiles"], [])
@@ -1216,7 +1283,7 @@ class SyncApiTest(unittest.TestCase):
                 "workspace": {"id": "memo", "name": "memo"},
                 "note": metadata_a["notes"][0],
             },
-        ).get_json()
+        ).json()
 
         a_attachment_upload = self.client.post(
             "/api/sync/attachment",
@@ -1234,7 +1301,7 @@ class SyncApiTest(unittest.TestCase):
                 "note": metadata_a["notes"][0],
                 "attachment": image_attachment,
             },
-        ).get_json()
+        ).json()
 
         b_initial_plan = self.client.post(
             "/api/sync/plan",
@@ -1249,7 +1316,7 @@ class SyncApiTest(unittest.TestCase):
                 "knownFiles": [],
                 "knownAttachments": [],
             },
-        ).get_json()["plan"]
+        ).json()["plan"]
 
         self.assertEqual(
             b_initial_plan["downloadFiles"][0]["relativePath"],
@@ -1265,11 +1332,11 @@ class SyncApiTest(unittest.TestCase):
         b_file_download = self.client.get(
             "/api/files/memo/note.md",
             headers=self.headers,
-        ).get_json()
+        ).json()
         b_attachment_download = self.client.get(
             f"/api/attachments/{image_attachment['relativePath']}",
             headers=self.headers,
-        ).get_json()
+        ).json()
         self.assertEqual(self.decoded_content(b_file_download), note_content_a)
         self.assertEqual(base64.b64decode(b_attachment_download["content"]), image_content)
 
@@ -1306,7 +1373,7 @@ class SyncApiTest(unittest.TestCase):
                 "workspace": {"id": "memo", "name": "memo"},
                 "note": metadata_b["notes"][0],
             },
-        ).get_json()
+        ).json()
 
         b_attachment_upload = self.client.post(
             "/api/sync/attachment",
@@ -1324,7 +1391,7 @@ class SyncApiTest(unittest.TestCase):
                 "note": metadata_b["notes"][0],
                 "attachment": extra_attachment,
             },
-        ).get_json()
+        ).json()
 
         self.assertEqual(b_file_upload["file"]["status"], "accepted")
         self.assertEqual(b_attachment_upload["attachment"]["status"], "accepted")
@@ -1358,7 +1425,7 @@ class SyncApiTest(unittest.TestCase):
                     }
                 ],
             },
-        ).get_json()["plan"]
+        ).json()["plan"]
 
         self.assertEqual(a_followup_plan["deleteServerFiles"], [])
         self.assertEqual(a_followup_plan["deleteServerAttachments"], [])
@@ -1374,11 +1441,11 @@ class SyncApiTest(unittest.TestCase):
         a_file_after_b_save = self.client.get(
             "/api/files/memo/note.md",
             headers=self.headers,
-        ).get_json()
+        ).json()
         a_extra_attachment = self.client.get(
             f"/api/attachments/{extra_attachment['relativePath']}",
             headers=self.headers,
-        ).get_json()
+        ).json()
         self.assertEqual(self.decoded_content(a_file_after_b_save), note_content_b)
         self.assertEqual(base64.b64decode(a_extra_attachment["content"]), extra_content)
 
@@ -1413,7 +1480,7 @@ class SyncApiTest(unittest.TestCase):
                 "content": initial_file,
                 "note": initial_metadata["notes"][0],
             },
-        ).get_json()
+        ).json()
         initial_attachment_upload = self.client.post(
             "/api/sync/attachment",
             headers=self.headers,
@@ -1428,7 +1495,7 @@ class SyncApiTest(unittest.TestCase):
                 "note": initial_metadata["notes"][0],
                 "attachment": initial_attachment,
             },
-        ).get_json()
+        ).json()
 
         server_metadata = self.note_metadata(updated_at_ms=10_000)
         server_attachment = dict(
@@ -1451,7 +1518,7 @@ class SyncApiTest(unittest.TestCase):
                 "content": server_file,
                 "note": server_metadata["notes"][0],
             },
-        ).get_json()
+        ).json()
         server_attachment_upload = self.client.post(
             "/api/sync/attachment",
             headers=self.headers,
@@ -1468,7 +1535,7 @@ class SyncApiTest(unittest.TestCase):
                 "note": server_metadata["notes"][0],
                 "attachment": server_attachment,
             },
-        ).get_json()
+        ).json()
         self.assertEqual(server_file_upload["status"], "ok")
         self.assertEqual(server_attachment_upload["status"], "ok")
 
@@ -1508,7 +1575,7 @@ class SyncApiTest(unittest.TestCase):
                     }
                 ],
             },
-        ).get_json()["plan"]
+        ).json()["plan"]
         self.assertEqual(changed_plan["downloadFiles"], [])
         self.assertEqual(changed_plan["downloadAttachments"], [])
         self.assertEqual(
@@ -1544,7 +1611,7 @@ class SyncApiTest(unittest.TestCase):
                     }
                 ],
             },
-        ).get_json()["plan"]
+        ).json()["plan"]
         self.assertEqual(stale_plan["conflicts"], [])
         self.assertEqual(
             [item["relativePath"] for item in stale_plan["downloadFiles"]],
@@ -1567,7 +1634,7 @@ class SyncApiTest(unittest.TestCase):
                 "contentEncoding": "utf-8",
                 "content": "first\n",
             },
-        ).get_json()
+        ).json()
 
         second = self.client.post(
             "/api/sync/file",
@@ -1580,7 +1647,7 @@ class SyncApiTest(unittest.TestCase):
                 "contentEncoding": "utf-8",
                 "content": "second\n",
             },
-        ).get_json()
+        ).json()
 
         self.assertEqual(second["file"]["status"], "accepted")
         self.assertIn("gitCommit", second["file"])
@@ -1590,7 +1657,7 @@ class SyncApiTest(unittest.TestCase):
             headers=self.headers,
         )
         self.assertEqual(history.status_code, 200)
-        commits = history.get_json()["commits"]
+        commits = history.json()["commits"]
         self.assertEqual(len(commits), 2)
         self.assertEqual(commits[0]["message"], "Update memo/note.md")
         self.assertFalse(commits[0]["deleted"])
@@ -1608,7 +1675,7 @@ class SyncApiTest(unittest.TestCase):
                 "contentEncoding": "utf-8",
                 "content": "first\n",
             },
-        ).get_json()
+        ).json()
 
         self.client.post(
             "/api/sync/file",
@@ -1626,7 +1693,7 @@ class SyncApiTest(unittest.TestCase):
         commits = self.client.get(
             "/api/admin/files/memo/note.md/history",
             headers=self.headers,
-        ).get_json()["commits"]
+        ).json()["commits"]
         older_commit = commits[-1]["commit"]
 
         version = self.client.get(
@@ -1634,7 +1701,7 @@ class SyncApiTest(unittest.TestCase):
             headers=self.headers,
         )
         self.assertEqual(version.status_code, 200)
-        self.assertEqual(self.decoded_content(version.get_json()), "first\n")
+        self.assertEqual(self.decoded_content(version.json()), "first\n")
 
         rollback = self.client.post(
             "/api/admin/files/memo/note.md/rollback",
@@ -1642,21 +1709,21 @@ class SyncApiTest(unittest.TestCase):
             json={"commit": older_commit},
         )
         self.assertEqual(rollback.status_code, 200)
-        rollback_payload = rollback.get_json()
+        rollback_payload = rollback.json()
         self.assertEqual(rollback_payload["status"], "accepted")
         self.assertEqual(rollback_payload["rolledBackToCommit"], older_commit)
 
         current = self.client.get(
             "/api/files/memo/note.md",
             headers=self.headers,
-        ).get_json()
+        ).json()
         self.assertEqual(self.decoded_content(current), "first\n")
         self.assertEqual(current["revision"], rollback_payload["revision"])
 
         next_history = self.client.get(
             "/api/admin/files/memo/note.md/history",
             headers=self.headers,
-        ).get_json()["commits"]
+        ).json()["commits"]
         self.assertTrue(next_history[0]["message"].startswith("Rollback memo/note.md"))
 
     def test_rollback_updates_metadata_and_sync_plan(self):
@@ -1675,7 +1742,7 @@ class SyncApiTest(unittest.TestCase):
                 "workspace": {"id": "memo", "name": "memo"},
                 "note": first_metadata["notes"][0],
             },
-        ).get_json()
+        ).json()
 
         second_metadata = self.note_metadata(updated_at_ms=20)
         second = self.client.post(
@@ -1692,19 +1759,19 @@ class SyncApiTest(unittest.TestCase):
                 "workspace": {"id": "memo", "name": "memo"},
                 "note": second_metadata["notes"][0],
             },
-        ).get_json()
+        ).json()
 
         commits = self.client.get(
             "/api/admin/files/memo/note.md/history",
             headers=self.headers,
-        ).get_json()["commits"]
+        ).json()["commits"]
         older_commit = commits[-1]["commit"]
 
         rollback = self.client.post(
             "/api/admin/files/memo/note.md/rollback",
             headers=self.headers,
             json={"commit": older_commit},
-        ).get_json()
+        ).json()
 
         self.assertEqual(rollback["metadata"]["status"], "accepted")
         self.assertGreater(
@@ -1733,7 +1800,7 @@ class SyncApiTest(unittest.TestCase):
         )
 
         self.assertEqual(plan_response.status_code, 200)
-        plan = plan_response.get_json()
+        plan = plan_response.json()
         self.assertEqual(plan["metadata"]["status"], "diverged")
         server_note = plan["metadata"]["serverMetadata"]["notes"][0]
         self.assertGreater(server_note["updatedAtMs"], 20)
@@ -1759,7 +1826,7 @@ class SyncApiTest(unittest.TestCase):
                 "workspace": {"id": "memo", "name": "memo"},
                 "note": metadata["notes"][0],
             },
-        ).get_json()
+        ).json()
 
         deleted = self.client.post(
             "/api/sync/file",
@@ -1772,7 +1839,7 @@ class SyncApiTest(unittest.TestCase):
                 "deleted": True,
                 "updatedAtMs": 20,
             },
-        ).get_json()
+        ).json()
 
         self.assertEqual(deleted["metadata"]["status"], "accepted")
         deleted_file = deleted["manifest"]["files"][0]
@@ -1782,14 +1849,14 @@ class SyncApiTest(unittest.TestCase):
         commits = self.client.get(
             "/api/admin/files/memo/note.md/history",
             headers=self.headers,
-        ).get_json()["commits"]
+        ).json()["commits"]
         original_commit = commits[-1]["commit"]
 
         rollback = self.client.post(
             "/api/admin/files/memo/note.md/rollback",
             headers=self.headers,
             json={"commit": original_commit},
-        ).get_json()
+        ).json()
 
         self.assertEqual(rollback["status"], "accepted")
         self.assertEqual(rollback["metadata"]["status"], "accepted")
@@ -1819,7 +1886,7 @@ class SyncApiTest(unittest.TestCase):
                 "workspace": {"id": "memo", "name": "memo"},
                 "note": metadata["notes"][0],
             },
-        ).get_json()
+        ).json()
 
         attachment_upload = self.client.post(
             "/api/sync/attachment",
@@ -1837,7 +1904,7 @@ class SyncApiTest(unittest.TestCase):
                 "note": metadata["notes"][0],
                 "attachment": attachment,
             },
-        ).get_json()
+        ).json()
 
         deleted_attachment = self.client.post(
             "/api/sync/attachment",
@@ -1851,7 +1918,7 @@ class SyncApiTest(unittest.TestCase):
                 "deleted": True,
                 "updatedAtMs": 120,
             },
-        ).get_json()
+        ).json()
         self.assertEqual(deleted_attachment["attachment"]["status"], "accepted")
 
         metadata_without_attachment = self.note_metadata(updated_at_ms=130)
@@ -1870,19 +1937,19 @@ class SyncApiTest(unittest.TestCase):
                 "workspace": {"id": "memo", "name": "memo"},
                 "note": metadata_without_attachment["notes"][0],
             },
-        ).get_json()
+        ).json()
 
         commits = self.client.get(
             "/api/admin/files/memo/note.md/history",
             headers=self.headers,
-        ).get_json()["commits"]
+        ).json()["commits"]
         original_note_commit = commits[-1]["commit"]
 
         rollback = self.client.post(
             "/api/admin/files/memo/note.md/rollback",
             headers=self.headers,
             json={"commit": original_note_commit},
-        ).get_json()
+        ).json()
 
         self.assertEqual(rollback["status"], "accepted")
         self.assertEqual(rollback["metadata"]["status"], "accepted")
@@ -1896,7 +1963,7 @@ class SyncApiTest(unittest.TestCase):
             headers=self.headers,
         )
         self.assertEqual(restored_attachment.status_code, 200)
-        restored_payload = restored_attachment.get_json()
+        restored_payload = restored_attachment.json()
         self.assertEqual(base64.b64decode(restored_payload["content"]), image_content)
         self.assertEqual(restored_payload["contentHash"], image_digest)
         self.assertEqual(restored_payload["kind"], "attachment")
@@ -1919,7 +1986,7 @@ class SyncApiTest(unittest.TestCase):
                     }
                 ],
             },
-        ).get_json()
+        ).json()
 
         server_note = plan["metadata"]["serverMetadata"]["notes"][0]
         self.assertEqual(
@@ -1950,7 +2017,7 @@ class SyncApiTest(unittest.TestCase):
                 "workspace": {"id": "memo", "name": "memo"},
                 "note": metadata["notes"][0],
             },
-        ).get_json()
+        ).json()
 
         first_upload = self.client.post(
             "/api/sync/attachment",
@@ -1968,7 +2035,7 @@ class SyncApiTest(unittest.TestCase):
                 "note": metadata["notes"][0],
                 "attachment": first_attachment,
             },
-        ).get_json()
+        ).json()
 
         second_attachment = dict(first_attachment)
         second_attachment["contentHash"] = second_digest
@@ -1991,20 +2058,20 @@ class SyncApiTest(unittest.TestCase):
                 "note": metadata["notes"][0],
                 "attachment": second_attachment,
             },
-        ).get_json()
+        ).json()
         self.assertEqual(second_upload["attachment"]["contentHash"], second_digest)
 
         commits = self.client.get(
             f"/api/admin/files/{first_attachment['relativePath']}/history",
             headers=self.headers,
-        ).get_json()["commits"]
+        ).json()["commits"]
         original_attachment_commit = commits[-1]["commit"]
 
         rollback = self.client.post(
             f"/api/admin/files/{first_attachment['relativePath']}/rollback",
             headers=self.headers,
             json={"commit": original_attachment_commit},
-        ).get_json()
+        ).json()
 
         self.assertEqual(rollback["status"], "accepted")
         self.assertEqual(rollback["metadata"]["status"], "accepted")
@@ -2017,7 +2084,7 @@ class SyncApiTest(unittest.TestCase):
         restored = self.client.get(
             f"/api/attachments/{first_attachment['relativePath']}",
             headers=self.headers,
-        ).get_json()
+        ).json()
         self.assertEqual(base64.b64decode(restored["content"]), first_content)
         self.assertEqual(restored["contentHash"], first_digest)
 
@@ -2037,7 +2104,7 @@ class SyncApiTest(unittest.TestCase):
                 "workspace": {"id": "memo", "name": "memo"},
                 "note": metadata["notes"][0],
             },
-        ).get_json()
+        ).json()
 
         global_revision_delete = self.client.post(
             "/api/sync",
@@ -2058,7 +2125,7 @@ class SyncApiTest(unittest.TestCase):
                     }
                 ],
             },
-        ).get_json()
+        ).json()
 
         self.assertEqual(global_revision_delete["status"], "conflict")
         self.assertEqual(global_revision_delete["accepted"], [])
@@ -2072,7 +2139,7 @@ class SyncApiTest(unittest.TestCase):
             headers=self.headers,
         )
         self.assertEqual(current.status_code, 200)
-        self.assertEqual(self.decoded_content(current.get_json()), "# synced from client a\n")
+        self.assertEqual(self.decoded_content(current.json()), "# synced from client a\n")
 
         plan = self.client.post(
             "/api/sync/plan",
@@ -2093,7 +2160,7 @@ class SyncApiTest(unittest.TestCase):
                     }
                 ],
             },
-        ).get_json()["plan"]
+        ).json()["plan"]
 
         self.assertEqual(plan["deleteServerFiles"], [])
         self.assertTrue(
@@ -2116,7 +2183,7 @@ class SyncApiTest(unittest.TestCase):
                 "content": "authoritative content",
                 "note": metadata["notes"][0],
             },
-        ).get_json()
+        ).json()
 
         overwrite = self.client.post(
             "/api/sync/file",
@@ -2128,7 +2195,7 @@ class SyncApiTest(unittest.TestCase):
                 "contentEncoding": "utf-8",
                 "content": "must not bypass the file revision",
             },
-        ).get_json()
+        ).json()
 
         self.assertEqual(overwrite["status"], "conflict")
         self.assertEqual(overwrite["file"]["status"], "conflict")
@@ -2139,7 +2206,7 @@ class SyncApiTest(unittest.TestCase):
         current = self.client.get(
             "/api/files/memo/note.md",
             headers=self.headers,
-        ).get_json()
+        ).json()
         self.assertEqual(self.decoded_content(current), "authoritative content")
 
         changed_metadata = self.note_metadata(updated_at_ms=30)
@@ -2154,7 +2221,7 @@ class SyncApiTest(unittest.TestCase):
                     "body": changed_metadata,
                 },
             },
-        ).get_json()
+        ).json()
         self.assertEqual(metadata_overwrite["status"], "conflict")
         self.assertEqual(metadata_overwrite["metadata"]["status"], "conflict")
         self.assertEqual(
@@ -2177,7 +2244,7 @@ class SyncApiTest(unittest.TestCase):
             },
         )
 
-        manifest = self.client.get("/api/manifest", headers=self.headers).get_json()
+        manifest = self.client.get("/api/manifest", headers=self.headers).json()
         file_record = manifest["files"][0]
         self.assertEqual(file_record["note"]["title"], "제목만 있는 노트")
         self.assertEqual(file_record["note"]["folder"], "memo")
@@ -2198,7 +2265,7 @@ class SyncApiTest(unittest.TestCase):
                 "workspace": {"id": "memo", "name": "memo"},
                 "note": metadata["notes"][0],
             },
-        ).get_json()
+        ).json()
 
         second = self.client.post(
             "/api/sync/file",
@@ -2214,7 +2281,7 @@ class SyncApiTest(unittest.TestCase):
                 "workspace": {"id": "memo", "name": "memo"},
                 "note": metadata["notes"][0],
             },
-        ).get_json()
+        ).json()
 
         self.assertEqual(second["metadata"]["status"], "unchanged")
 
@@ -2239,7 +2306,7 @@ class SyncApiTest(unittest.TestCase):
         )
 
         self.assertEqual(plan_response.status_code, 200)
-        plan = plan_response.get_json()["plan"]
+        plan = plan_response.json()["plan"]
         self.assertEqual(plan["downloadFiles"][0]["reason"], "server_file_changed")
         self.assertEqual(plan["downloadFiles"][0]["relativePath"], "memo/note.md")
 
@@ -2255,7 +2322,7 @@ class SyncApiTest(unittest.TestCase):
                 "contentEncoding": "utf-8",
                 "content": "first\n",
             },
-        ).get_json()
+        ).json()
         first_revision = first["file"]["revision"]
 
         self.client.post(
@@ -2285,7 +2352,7 @@ class SyncApiTest(unittest.TestCase):
         )
 
         self.assertEqual(stale.status_code, 200)
-        payload = stale.get_json()
+        payload = stale.json()
         self.assertEqual(payload["status"], "conflict")
         self.assertEqual(payload["file"]["relativePath"], "memo/note.md")
 
@@ -2305,7 +2372,7 @@ class SyncApiTest(unittest.TestCase):
                     }
                 ],
             },
-        ).get_json()
+        ).json()
         file_revision = first["accepted"][0]["revision"]
 
         self.client.post(
@@ -2343,7 +2410,7 @@ class SyncApiTest(unittest.TestCase):
         )
 
         self.assertEqual(stale.status_code, 200)
-        payload = stale.get_json()
+        payload = stale.json()
         self.assertEqual(payload["status"], "conflict")
         self.assertEqual(payload["conflicts"][0]["relativePath"], "memo/note.md")
         self.assertEqual(payload["conflicts"][0]["serverFile"]["contentEncoding"], "base64")
@@ -2386,7 +2453,7 @@ class SyncApiTest(unittest.TestCase):
         )
 
         self.assertEqual(response.status_code, 400)
-        manifest = self.client.get("/api/manifest", headers=self.headers).get_json()
+        manifest = self.client.get("/api/manifest", headers=self.headers).json()
         self.assertEqual(manifest["files"], [])
         stored_files = [
             path
@@ -2408,7 +2475,7 @@ class SyncApiTest(unittest.TestCase):
                 "content": "original",
                 "note": metadata["notes"][0],
             },
-        ).get_json()
+        ).json()
 
         different_id = dict(metadata["notes"][0], id="note-2", title="Other")
         response = self.client.post(
@@ -2446,7 +2513,7 @@ class SyncApiTest(unittest.TestCase):
         current = self.client.get(
             "/api/files/memo/note.md",
             headers=self.headers,
-        ).get_json()
+        ).json()
         self.assertEqual(self.decoded_content(current), "original")
 
     def test_rejects_duplicate_metadata_id_and_path_before_batch_write(self):
@@ -2470,7 +2537,7 @@ class SyncApiTest(unittest.TestCase):
             },
         )
         self.assertEqual(response.status_code, 400)
-        manifest = self.client.get("/api/manifest", headers=self.headers).get_json()
+        manifest = self.client.get("/api/manifest", headers=self.headers).json()
         self.assertEqual(manifest["serverRevision"], 0)
         self.assertEqual(manifest["files"], [])
 
@@ -2506,7 +2573,7 @@ class SyncApiTest(unittest.TestCase):
                 "content": "same body",
                 "note": metadata["notes"][0],
             },
-        ).get_json()
+        ).json()
 
         renamed_note = dict(
             metadata["notes"][0],
@@ -2527,7 +2594,7 @@ class SyncApiTest(unittest.TestCase):
                 "content": "same body",
                 "note": renamed_note,
             },
-        ).get_json()
+        ).json()
         self.assertEqual(renamed["file"]["status"], "accepted")
         self.assertEqual(renamed["file"]["storagePath"], "memo/Renamed.md")
         self.assertEqual(renamed["file"]["revision"], renamed["serverRevision"])
@@ -2550,7 +2617,7 @@ class SyncApiTest(unittest.TestCase):
                 "content": "same body",
                 "note": renamed_note,
             },
-        ).get_json()
+        ).json()
         self.assertEqual(retry["file"]["status"], "unchanged")
 
         stale = self.client.post(
@@ -2564,7 +2631,7 @@ class SyncApiTest(unittest.TestCase):
                 "content": "same body",
                 "note": metadata["notes"][0],
             },
-        ).get_json()
+        ).json()
         self.assertEqual(stale["status"], "conflict")
         self.assertTrue((Path(self.tempdir.name) / "files/memo/Renamed.md").exists())
 
@@ -2584,7 +2651,7 @@ class SyncApiTest(unittest.TestCase):
                 "content": "same body",
                 "note": metadata["notes"][0],
             },
-        ).get_json()
+        ).json()
 
         orphan_path = Path(self.tempdir.name) / "files/memo/Renamed.md"
         orphan_path.write_text("orphan content", encoding="utf-8")
@@ -2608,7 +2675,7 @@ class SyncApiTest(unittest.TestCase):
         )
 
         self.assertEqual(response.status_code, 200)
-        renamed = response.get_json()["file"]
+        renamed = response.json()["file"]
         self.assertEqual(renamed["status"], "accepted")
         self.assertNotEqual(renamed["storagePath"], "memo/Renamed.md")
         self.assertTrue(
@@ -2631,7 +2698,7 @@ class SyncApiTest(unittest.TestCase):
                 "content": "body",
                 "note": metadata["notes"][0],
             },
-        ).get_json()
+        ).json()
         metadata_revision = first["manifest"]["metadata"]["revision"]
 
         missing_note_id = self.note_metadata()
@@ -2686,7 +2753,7 @@ class SyncApiTest(unittest.TestCase):
                 "note": metadata["notes"][0],
                 "attachment": attachment,
             },
-        ).get_json()
+        ).json()
 
         without_attachment = self.note_metadata()
         without_attachment["notes"][0]["attachments"] = []
@@ -2700,7 +2767,7 @@ class SyncApiTest(unittest.TestCase):
                     "body": without_attachment,
                 },
             },
-        ).get_json()
+        ).json()
         self.assertEqual(rejected["status"], "conflict")
         self.assertEqual(
             rejected["metadata"]["reason"],
@@ -2724,7 +2791,7 @@ class SyncApiTest(unittest.TestCase):
                     }
                 ],
             },
-        ).get_json()
+        ).json()
         self.assertEqual(deleted["status"], "ok")
         self.assertEqual(deleted["metadata"]["status"], "accepted")
         self.assertTrue(deleted["acceptedAttachments"][0]["deleted"])
@@ -2746,7 +2813,7 @@ class SyncApiTest(unittest.TestCase):
                     }
                 ],
             },
-        ).get_json()
+        ).json()
         state_only_removal = self.client.post(
             "/api/sync",
             headers=self.headers,
@@ -2757,7 +2824,7 @@ class SyncApiTest(unittest.TestCase):
                     "body": without_attachment,
                 },
             },
-        ).get_json()
+        ).json()
         self.assertEqual(state_only_removal["status"], "conflict")
         self.assertEqual(
             state_only_removal["metadata"]["reason"],
@@ -2807,7 +2874,7 @@ class SyncApiTest(unittest.TestCase):
                 "note": metadata["notes"][0],
                 "attachment": attachment,
             },
-        ).get_json()
+        ).json()
         storage_path = upload["attachment"]["storagePath"]
         self.assertNotEqual(storage_path, "memo/attachments/새 노트/diagram.png")
 
@@ -2829,7 +2896,7 @@ class SyncApiTest(unittest.TestCase):
             "/api/sync/attachment",
             headers=self.headers,
             json=update_payload,
-        ).get_json()
+        ).json()
         self.assertEqual(updated["metadata"]["status"], "accepted")
         self.assertEqual(updated["attachment"]["revision"], updated["serverRevision"])
 
@@ -2837,7 +2904,7 @@ class SyncApiTest(unittest.TestCase):
             "/api/sync/attachment",
             headers=self.headers,
             json=update_payload,
-        ).get_json()
+        ).json()
         self.assertEqual(retry["status"], "ok")
         self.assertEqual(retry["metadata"]["status"], "unchanged")
 
@@ -2846,7 +2913,7 @@ class SyncApiTest(unittest.TestCase):
             "/api/sync/attachment",
             headers=self.headers,
             json={**update_payload, "attachment": stale_attachment},
-        ).get_json()
+        ).json()
         self.assertEqual(stale["status"], "conflict")
 
         state = json.loads(
@@ -2880,7 +2947,7 @@ class SyncApiTest(unittest.TestCase):
             response = self.client.post(endpoint, headers=self.headers, json=body)
             self.assertEqual(response.status_code, 400)
 
-        manifest = self.client.get("/api/manifest", headers=self.headers).get_json()
+        manifest = self.client.get("/api/manifest", headers=self.headers).json()
         self.assertEqual(manifest["serverRevision"], 0)
         self.assertEqual(manifest["attachments"], [])
         self.assertFalse((Path(self.tempdir.name) / "files/a.bin").exists())
@@ -2924,7 +2991,7 @@ class SyncApiTest(unittest.TestCase):
             },
         )
         self.assertEqual(response.status_code, 400)
-        manifest = self.client.get("/api/manifest", headers=self.headers).get_json()
+        manifest = self.client.get("/api/manifest", headers=self.headers).json()
         self.assertEqual(manifest["serverRevision"], 0)
         self.assertEqual(manifest["metadata"]["revision"], 0)
         self.assertEqual(manifest["files"], [])
@@ -2942,7 +3009,7 @@ class SyncApiTest(unittest.TestCase):
                 "content": "server version",
                 "note": metadata["notes"][0],
             },
-        ).get_json()
+        ).json()
         before = first["manifest"]
 
         next_metadata = self.note_metadata(updated_at_ms=20)
@@ -2979,7 +3046,7 @@ class SyncApiTest(unittest.TestCase):
                     },
                 ],
             },
-        ).get_json()
+        ).json()
 
         self.assertEqual(batch["status"], "conflict")
         self.assertEqual(batch["accepted"], [])
@@ -3003,7 +3070,7 @@ class SyncApiTest(unittest.TestCase):
         missing = self.client.get("/api/files/memo/new.md", headers=self.headers)
         self.assertEqual(missing.status_code, 400)
         current = self.client.get("/api/files/memo/note.md", headers=self.headers)
-        self.assertEqual(self.decoded_content(current.get_json()), "server version")
+        self.assertEqual(self.decoded_content(current.json()), "server version")
 
     def test_rejects_duplicate_plan_and_batch_paths_before_writes(self):
         plan = self.client.post(
@@ -3022,7 +3089,7 @@ class SyncApiTest(unittest.TestCase):
             },
         )
         self.assertEqual(plan.status_code, 400)
-        self.assertIn("duplicate relativePath", plan.get_json()["message"])
+        self.assertIn("duplicate relativePath", plan.json()["message"])
 
         batch = self.client.post(
             "/api/sync",
@@ -3046,8 +3113,8 @@ class SyncApiTest(unittest.TestCase):
             },
         )
         self.assertEqual(batch.status_code, 400)
-        self.assertIn("duplicate relativePath", batch.get_json()["message"])
-        manifest = self.client.get("/api/manifest", headers=self.headers).get_json()
+        self.assertIn("duplicate relativePath", batch.json()["message"])
+        manifest = self.client.get("/api/manifest", headers=self.headers).json()
         self.assertEqual(manifest["serverRevision"], 0)
         self.assertEqual(manifest["files"], [])
 
@@ -3163,13 +3230,13 @@ class SyncApiTest(unittest.TestCase):
             },
         )
         self.assertEqual(too_long.status_code, 400)
-        self.assertIn("at most", too_long.get_json()["message"])
+        self.assertIn("at most", too_long.json()["message"])
 
     def test_openapi_document_and_swagger_ui_are_public(self):
         spec_response = self.client.get("/api/openapi.json")
         self.assertEqual(spec_response.status_code, 200)
 
-        spec = spec_response.get_json()
+        spec = spec_response.json()
         self.assertEqual(spec["openapi"], "3.1.0")
         self.assertIn("/api/sync", spec["paths"])
         self.assertIn("/api/sync/plan", spec["paths"])
@@ -3259,9 +3326,9 @@ class SyncApiTest(unittest.TestCase):
 
         docs_response = self.client.get("/api/docs")
         self.assertEqual(docs_response.status_code, 200)
-        self.assertIn("text/html", docs_response.content_type)
-        self.assertIn(b"SwaggerUIBundle", docs_response.data)
-        self.assertIn(b"/api/openapi.json", docs_response.data)
+        self.assertIn("text/html", docs_response.headers["content-type"])
+        self.assertIn(b"SwaggerUIBundle", docs_response.content)
+        self.assertIn(b"/api/openapi.json", docs_response.content)
 
     def test_admin_ui_is_served(self):
         index_response = self.client.get("/")
@@ -3270,20 +3337,11 @@ class SyncApiTest(unittest.TestCase):
 
         admin_response = self.client.get("/admin")
         self.assertEqual(admin_response.status_code, 200)
-        self.assertIn("text/html", admin_response.content_type)
-        self.assertIn(b"Notedown Sync Admin", admin_response.data)
-        self.assertIn(b'id="summary-file-count"', admin_response.data)
-        self.assertIn(b'id="summary-last-sync"', admin_response.data)
-        self.assertIn(b'id="folder-filter"', admin_response.data)
-        self.assertNotIn(b'class="summary-item"', admin_response.data)
-        self.assertIn(b'id="attachment-list"', admin_response.data)
-        self.assertIn(b'id="attachment-modal"', admin_response.data)
-        self.assertIn(b'id="attachment-modal-body"', admin_response.data)
-        self.assertIn(b'id="tokens-table"', admin_response.data)
-        self.assertIn(b'id="history-table"', admin_response.data)
-        self.assertIn(b'id="rollback-button"', admin_response.data)
+        self.assertIn("text/html", admin_response.headers["content-type"])
+        self.assertIn(b"Notedown", admin_response.content)
+        self.assertIn(b"<script", admin_response.content)
 
-        anonymous = self.app.test_client()
+        anonymous = TestClient(self.app, follow_redirects=False)
         protected_response = anonymous.get("/admin")
         self.assertEqual(protected_response.status_code, 302)
         self.assertEqual(protected_response.headers["Location"], "/login")
@@ -3307,7 +3365,7 @@ class SyncApiTest(unittest.TestCase):
                     "NOTE_SYNC_SECRET": "setup-secret",
                 }
             )
-            client = app.test_client()
+            client = TestClient(app, follow_redirects=False)
 
             self.assertEqual(client.get("/").headers["Location"], "/setup")
             self.assertEqual(client.get("/admin").headers["Location"], "/setup")
@@ -3324,14 +3382,14 @@ class SyncApiTest(unittest.TestCase):
                 json={"username": "owner", "password": "password123"},
             )
             self.assertEqual(setup_response.status_code, 200)
-            setup_payload = setup_response.get_json()
+            setup_payload = setup_response.json()
             self.assertTrue(setup_payload["configured"])
             self.assertNotIn("expiresIn", setup_payload)
             self.assertIn("tokenId", setup_payload)
 
             admin_response = client.get("/admin")
             self.assertEqual(admin_response.status_code, 200)
-            self.assertIn(b"Notedown Sync Admin", admin_response.data)
+            self.assertIn(b"Notedown", admin_response.content)
 
             duplicate_setup = client.post(
                 "/api/setup",

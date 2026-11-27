@@ -1,0 +1,31 @@
+name: notedown-preview
+services:
+  web:
+    build:
+      context: .
+      args:
+        VERSION: 2.0.2-preview
+    image: notedown-fastapi:preview
+    init: true
+    restart: unless-stopped
+    ports:
+      - "${NOTEDOWN_PREVIEW_BIND_ADDRESS:-0.0.0.0}:${NOTEDOWN_PREVIEW_PORT:-5501}:5500"
+    environment:
+      NOTE_SYNC_STORAGE: /data
+      NOTE_SYNC_AUTH_FILE: /data/auth.json
+      NOTE_SYNC_SECRET: "${NOTE_SYNC_SECRET:?Set NOTE_SYNC_SECRET in .env.preview}"
+      NOTE_SYNC_CORS_ORIGIN: "${NOTE_SYNC_CORS_ORIGIN:-*}"
+      NOTE_SYNC_PUBLIC_ORIGIN: "${NOTE_SYNC_PUBLIC_ORIGIN:-}"
+      NOTE_SYNC_SECURE_COOKIES: "${NOTE_SYNC_SECURE_COOKIES:-false}"
+      TZ: Asia/Seoul
+    volumes:
+      - preview-data:/data
+    stop_grace_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: '3'
+volumes:
+  preview-data:
+    name: notedown-preview-data

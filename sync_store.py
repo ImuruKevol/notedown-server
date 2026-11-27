@@ -5045,8 +5045,6 @@ class SyncStore:
             "--",
             storage_path,
         ).stdout.strip()
-        if not output:
-            return []
 
         commits = []
         for line in output.splitlines():
@@ -5072,6 +5070,35 @@ class SyncStore:
                     "size": len(content) if content is not None else 0,
                 }
             )
+        # Git's rename detection is similarity-based. Renaming a note while
+        # rewriting its content can therefore hide its earlier versions from
+        # ``log --follow``. Our existing snapshots identify those commits even
+        # when Git cannot infer the rename.
+        known_commits = {item["commit"] for item in commits}
+        snapshots = (record or {}).get("metadataSnapshots") or {}
+        for commit in reversed(list(snapshots)):
+            if commit in known_commits or not COMMIT_RE.fullmatch(commit):
+                continue
+            info = self._git_commit_info(commit)
+            content = self._git_file_content(relative_path, commit, record)
+            commits.append(
+                {
+                    **info,
+                    "deleted": content is None,
+                    "contentHash": sha256_bytes(content) if content is not None else None,
+                    "size": len(content) if content is not None else 0,
+                }
+            )
+        def committed_timestamp(item):
+            try:
+                value = datetime.fromisoformat(item.get("committedAt") or "")
+                if value.tzinfo is None:
+                    value = value.replace(tzinfo=timezone.utc)
+                return value.timestamp()
+            except (TypeError, ValueError, OSError, OverflowError):
+                return 0
+
+        commits.sort(key=committed_timestamp, reverse=True)
         return commits
 
     def _resolve_history_commit(self, relative_path, commit, record=None):
@@ -5119,7 +5146,13 @@ class SyncStore:
         storage_path = normalize_relative_path(
             storage_path or self._storage_path_for_record(relative_path, record)
         )
-        candidate_paths = [storage_path]
+        candidate_paths = []
+        snapshot = self._metadata_snapshot_for_commit(record, commit)
+        entry = snapshot.get("attachment" if self._is_attachment_record(record) else "note")
+        if isinstance(entry, dict) and entry.get("storagePath"):
+            candidate_paths.append(normalize_relative_path(entry["storagePath"]))
+        if storage_path not in candidate_paths:
+            candidate_paths.append(storage_path)
         if relative_path not in candidate_paths:
             candidate_paths.append(relative_path)
 
